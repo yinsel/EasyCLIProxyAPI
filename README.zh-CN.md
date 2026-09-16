@@ -170,10 +170,10 @@ GitHub Actions 会构建以下发行包：
 
 - [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) — 本软件负责管理的代理内核。
 
-### fork 仓库的 macOS 构建
+### macOS 构建与首次运行
 
-工作流在未配置 Apple 签名凭据时会生成临时签名（ad-hoc）的 DMG，支持 Intel 和 Apple Silicon；此类安装包未经 Apple 公证，首次打开可能需要在系统「隐私与安全性」中允许。
+工作流直接生成 Intel 和 Apple Silicon 的 DMG，不使用 Apple 开发者证书、不导入钥匙串、不执行 Apple 公证，也无需配置 Apple Actions Secrets。为满足 Apple Silicon 的运行要求，仅由 Tauri 自动附加无需证书的本地临时签名（ad-hoc）。
 
-正式签名及公证需要配置 `APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID` 六项 Actions Secrets。只配置了部分凭据时会提示缺失项并停止，避免误生成未公证的正式安装包。
+安装后首次打开如果被 macOS 拦截，可在「系统设置 → 隐私与安全性」中选择「仍要打开」，确认运行自己信任的安装包。
 
 `feat/monkeycode-support` 分支 push 会自动构建并上传 Actions 安装包，供验证使用。发布 GitHub Release 仍需推送版本标签，或手动运行工作流并填写 `release_tag`。
