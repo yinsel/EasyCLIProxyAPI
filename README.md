@@ -89,6 +89,26 @@ You can add multiple connections, search existing entries, refresh provider stat
 through the unified local CLIProxyAPI endpoint. Requests and responses can be converted between
 supported OpenAI, Claude, Gemini, and compatible formats.
 
+### Optional MonkeyCode signing
+
+Use the existing **OpenAI**, **Codex**, or **Claude** API access entry for the upstream
+protocol. In **Advanced settings**, set `signing_secret` to the complete paired `omas_...`
+value (including the prefix, without Base64 decoding). Leave it blank to disable signing.
+Signing requires one API key and an explicit Base URL, using the usual protocol URL format:
+OpenAI/Codex typically end in `/v1`; Claude uses the service root. Select the models offered
+by that upstream, or add their names manually if model discovery is unavailable.
+
+The bundled stock CLIProxyAPI still handles protocol conversion. An in-process loopback
+bridge signs the final outgoing system prompt with HMAC-SHA256 and streams the response.
+The original protocol and request body are preserved. HTTP/SSE is supported; signing disables
+Codex WebSocket transport. Requests need a non-empty system prompt, and health checks include
+one in the appropriate protocol format.
+
+Keep the desktop app running. Local bridge addresses are refreshed before the core starts.
+Upstream proxy settings are honored. Credentials are stored in core configuration, with
+bridge metadata encoded in a reserved header (not encrypted). This header is removed before
+forwarding. Do not share `config.yaml`.
+
 ### Usage history and token analytics
 
 ![Usage history and token analytics](docs/screenshots/en/4.png)

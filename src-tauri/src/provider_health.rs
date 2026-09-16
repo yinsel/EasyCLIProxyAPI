@@ -18,6 +18,8 @@ pub(crate) struct ProviderHealthProbeRequest {
     url: String,
     header: HashMap<String, String>,
     data: String,
+    #[serde(default)]
+    signing_secret: Option<String>,
     protocol: String,
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -339,6 +341,13 @@ pub(crate) async fn provider_health_probe(
     }
 
     let started_at = Instant::now();
+    if let Some(secret) = &request.signing_secret {
+        let signature = crate::monkeycode::signature(request.data.as_bytes(), secret)?;
+        headers.insert(
+            "x-ohmyagent-signature",
+            signature.parse().map_err(|_| "Invalid signature")?,
+        );
+    }
     let response = client
         .post(url)
         .headers(headers)

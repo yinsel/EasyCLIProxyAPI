@@ -385,3 +385,22 @@ describe('API 接入配置合并', () => {
     expect(Array.from(selected)).toEqual(['model-a', 'model-b']);
   });
 });
+
+
+describe('optional MonkeyCode signing', () => {
+  for (const section of ['openai-compatibility', 'codex-api-key', 'claude-api-key'] as const) {
+    it(`persists, rotates and removes the secret without changing ${section}`, () => {
+      const draft = applyProviderRemarkIdentity(section, {
+        ...createProviderDraft(section),
+        remark: 'Signed upstream', apiKey: 'oma_test', baseUrl: 'https://mc.example/v1',
+        signingSecret: 'omas_test_secret', models: [{ name: 'test-model' }],
+      });
+      const record = buildProviderRecord(section, draft);
+      expect(record.signing_secret).toBe('omas_test_secret');
+      expect(record.provider).toBeUndefined();
+      expect(providerCategoryMatchesRecord(section, record)).toBe(true);
+      expect(buildProviderRecord(section, { ...draft, signingSecret: 'omas_rotated' }, record).signing_secret).toBe('omas_rotated');
+      expect(buildProviderRecord(section, { ...draft, signingSecret: '' }, record).signing_secret).toBeUndefined();
+    });
+  }
+});

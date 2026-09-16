@@ -3,6 +3,8 @@ import { easyModeZhCN } from '../easyMode';
 export const zhCN = {
   ...easyModeZhCN,
   'apiAccess.provider.codex': 'Codex API',
+  'apiAccess.monkeycode.secretHint': '可选：填入与 API Key 配套的完整 omas_...（包含前缀，不做 Base64 解码）以启用 MonkeyCode 签名；留空关闭。签名使用 HTTP/SSE，Codex WebSocket 将关闭。',
+  'apiAccess.monkeycode.credentialsRequired': '启用 MonkeyCode 签名需要明确的 Base URL、一个 API Key 及其配套的 signing_secret。',
   'apiAccess.provider.deepseek': 'DeepSeek',
   'apiAccess.provider.claude': 'Claude',
   'apiAccess.provider.gemini': 'Gemini',

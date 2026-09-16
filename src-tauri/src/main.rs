@@ -12,6 +12,7 @@ mod core_runtime;
 mod desktop_theme;
 mod instance_lock;
 mod management_api;
+mod monkeycode;
 mod oauth_browser;
 mod progress;
 mod provider_health;

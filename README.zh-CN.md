@@ -79,6 +79,23 @@ API 接入页面按照协议或 Provider 管理上游 API 凭证和服务地址�
 然后通过统一的本地 CLIProxyAPI 地址调用它们。请求和响应可以在 OpenAI、Claude、Gemini
 及其他兼容协议之间转换。
 
+#### MonkeyCode 可选签名
+
+按上游协议在现有 **OpenAI、Codex 或 Claude** 分类中添加接入，在 **高级设置** 填写
+`signing_secret` 即可启用 MonkeyCode 签名，留空则保持原有行为。
+填写与 API Key 配套的完整 `omas_...`（含前缀，不做 Base64 解码）。启用签名需配置一个
+API Key 和明确的 Base URL，沿用对应协议的 URL 格式：OpenAI/Codex 通常以 `/v1` 结尾，
+Claude 填服务根地址。选择上游实际支持的模型；不支持模型发现时可手动添加。
+
+仍由随应用下载的原版 CLIProxyAPI 完成协议转换，应用内的本地转发层仅对最终请求中的
+system prompt 计算 HMAC-SHA256 签名，并流式转发响应。保留原有协议与请求体。
+签名支持 HTTP/SSE；启用后关闭 Codex WebSocket。请求需包含非空 system prompt，
+健康检查会按对应协议加入测试 prompt 并签名。
+
+使用期间请保持应用运行。每次启动内核前会刷新本地转发地址，转发层遵循上游代理设置。
+凭据保存在内核配置中，转发元数据通过保留请求头编码保存（并非加密），转发前会移除该头。
+请勿分享包含凭据的 `config.yaml`。
+
 ### 使用记录与 Token 统计
 
 ![使用记录与 Token 统计](docs/screenshots/zh-CN/4.png)

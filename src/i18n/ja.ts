@@ -4,6 +4,8 @@ import { easyModeJa } from './easyMode';
 export const jaOverrides = {
   ...easyModeJa,
   'apiAccess.provider.codex': 'Codex API',
+  'apiAccess.monkeycode.secretHint': '任意：API キーに対応する omas_... 全体を入力してください（接頭辞を含む、Base64 デコード不要）。空欄で署名を無効化します。署名は HTTP/SSE を使用し、Codex WebSocket は無効になります。',
+  'apiAccess.monkeycode.credentialsRequired': 'MonkeyCode 署名には Base URL、1 つの API キー、および対応する signing_secret が必要です。',
   'apiAccess.provider.deepseek': 'DeepSeek',
   'apiAccess.provider.claude': 'Claude',
   'apiAccess.provider.gemini': 'Gemini',

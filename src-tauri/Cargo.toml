@@ -10,6 +10,8 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+hmac = "0.12"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"

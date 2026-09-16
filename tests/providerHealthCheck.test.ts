@@ -236,3 +236,23 @@ describe('API 接入健康检测', () => {
   });
 
 });
+
+
+it('signed health probes preserve each protocol and include a signable prompt', () => {
+  for (const provider of ['openai', 'codex', 'claude'] as const) {
+    const base = provider === 'claude' ? 'https://mc.example' : 'https://mc.example/v1';
+    const probe = buildProviderHealthProbe(provider, base, 'test-model', 'oma_test', '', {}, true);
+    const body = JSON.parse(probe.data);
+    if (provider === 'openai') {
+      expect(probe.url).toBe('https://mc.example/v1/chat/completions');
+      expect(body.messages[0].role).toBe('system');
+    } else if (provider === 'codex') {
+      expect(probe.url).toBe('https://mc.example/v1/responses');
+      expect(body.instructions).toBe('You are a helpful assistant.');
+      expect(Array.isArray(body.input)).toBe(true);
+    } else {
+      expect(probe.url).toBe('https://mc.example/v1/messages');
+      expect(body.system).toBe('You are a helpful assistant.');
+    }
+  }
+});

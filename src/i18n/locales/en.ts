@@ -4,6 +4,8 @@ import { easyModeEn } from '../easyMode';
 export const en: Record<MessageKey, string> = {
   ...easyModeEn,
   'apiAccess.provider.codex': 'Codex API',
+  'apiAccess.monkeycode.secretHint': 'Optional: enter the complete paired omas_... secret, including its prefix, without Base64 decoding. Leave blank to disable MonkeyCode signing. Signing uses HTTP/SSE and disables Codex WebSocket.',
+  'apiAccess.monkeycode.credentialsRequired': 'MonkeyCode signing requires an explicit Base URL, one API key, and its paired signing_secret.',
   'apiAccess.provider.deepseek': 'DeepSeek',
   'apiAccess.provider.claude': 'Claude',
   'apiAccess.provider.gemini': 'Gemini',

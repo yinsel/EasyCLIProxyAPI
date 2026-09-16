@@ -89,7 +89,13 @@ pub(crate) async fn management_request(
     if let Some(query) = request.query {
         builder = builder.query(&query);
     }
-    if let Some(body) = request.body {
+    if let Some(mut body) = request.body {
+        if matches!(
+            path.trim_matches('/'),
+            "openai-compatibility" | "codex-api-key" | "claude-api-key"
+        ) {
+            crate::monkeycode::encode_config(&mut body, Some(path.trim_matches('/')))?;
+        }
         builder = builder.json(&body);
     }
 
@@ -97,7 +103,14 @@ pub(crate) async fn management_request(
         .send()
         .await
         .map_err(|err| format_management_request_error("请求管理 API 失败", &err))?;
-    read_management_value(response).await
+    let mut value = read_management_value(response).await?;
+    if matches!(
+        path.trim_matches('/'),
+        "config" | "openai-compatibility" | "codex-api-key" | "claude-api-key"
+    ) {
+        crate::monkeycode::decode_config(&mut value);
+    }
+    Ok(value)
 }
 
 #[tauri::command]

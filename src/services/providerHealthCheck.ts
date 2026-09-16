@@ -35,6 +35,7 @@ export type ProviderHealthCheckOptions = {
   authIndex?: string;
   customHeaders?: Record<string, string>;
   timeoutMs?: number;
+  signingSecret?: string;
 };
 
 const defaultBaseUrl = (provider: ModelProvider) => {
@@ -102,6 +103,7 @@ export function buildProviderHealthProbe(
   apiKey: string,
   authIndex = '',
   customHeaders: Record<string, string> = {},
+  signingEnabled = false,
 ): ProviderHealthProbe {
   const root = endpointRoot(provider, baseUrl);
   const headers = { ...customHeaders };
@@ -144,6 +146,7 @@ export function buildProviderHealthProbe(
       protocol: 'claude',
       data: JSON.stringify({
         model: normalizedModel,
+        ...(signingEnabled ? { system: 'You are a helpful assistant.' } : {}),
         max_tokens: 16,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
@@ -164,7 +167,9 @@ export function buildProviderHealthProbe(
       protocol: 'openai-responses',
       data: JSON.stringify({
         model: normalizedModel,
-        input: 'hi',
+        ...(signingEnabled
+          ? { instructions: 'You are a helpful assistant.', input: [{ role: 'user', content: 'hi' }] }
+          : { input: 'hi' }),
         stream: true,
       }),
     };
@@ -177,7 +182,10 @@ export function buildProviderHealthProbe(
     protocol: 'openai-chat',
     data: JSON.stringify({
       model: normalizedModel,
-      messages: [{ role: 'user', content: 'hi' }],
+      messages: [
+        ...(signingEnabled ? [{ role: 'system', content: 'You are a helpful assistant.' }] : []),
+        { role: 'user', content: 'hi' },
+      ],
       stream: true,
     }),
   };
@@ -199,6 +207,7 @@ export async function checkProviderHealthProbe(
   authIndex = '',
   customHeaders: Record<string, string> = {},
   timeoutMs = PROVIDER_HEALTH_TIMEOUT_MS,
+  signingSecret?: string,
 ): Promise<ProviderHealthProbeResult> {
   try {
     const probe = buildProviderHealthProbe(
@@ -208,6 +217,7 @@ export async function checkProviderHealthProbe(
       apiKey,
       authIndex,
       customHeaders,
+      Boolean(signingSecret),
     );
     if (Object.values(probe.header).some((value) => value.includes('$TOKEN$'))) {
       return {
@@ -220,6 +230,7 @@ export async function checkProviderHealthProbe(
       responseLatencyMs: number;
     }>('provider_health_probe', {
       request: {
+        ...(signingSecret ? { signingSecret } : {}),
         protocol: probe.protocol,
         timeoutMs,
         data: probe.data,
@@ -263,6 +274,7 @@ export async function checkProviderModelHealth(
     options.authIndex,
     options.customHeaders,
     options.timeoutMs,
+    options.signingSecret,
   );
   return {
     ...result,

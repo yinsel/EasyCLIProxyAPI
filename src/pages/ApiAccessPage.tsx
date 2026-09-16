@@ -208,6 +208,7 @@ export type ProviderDraft = {
   testModel?: string;
   thinkingLevels?: string[];
   disabled?: boolean;
+  signingSecret?: string;
   cloakMode?: string;
   cloakStrictMode?: boolean;
   cloakSensitiveWordsText?: string;
@@ -485,6 +486,7 @@ const draftFromRow = (row: ProviderRow): ProviderDraft => {
   const isDeepSeek = row.section === 'codex-api-key' && isDeepSeekRecord(row.record);
   return {
     name: isDeepSeek ? 'DeepSeek' : row.name,
+    signingSecret: readString(row.record, 'signing_secret') || undefined,
     apiKey: definition.openAi ? row.apiKeys.join('\n') : row.apiKey,
     remark: row.remark || (definition.openAi && !isDeepSeek ? row.name : ''),
     baseUrl: row.baseUrl,
@@ -632,8 +634,12 @@ const applyAdvancedFields = (
     if (draft.disableCooling) next['disable-cooling'] = true;
     else delete next['disable-cooling'];
   }
+  if (draft.signingSecret !== undefined && section !== 'gemini-api-key') {
+    if (draft.signingSecret) next.signing_secret = draft.signingSecret;
+    else delete next.signing_secret;
+  }
   if (draft.websockets !== undefined && section === 'codex-api-key') {
-    next.websockets = draft.websockets;
+    next.websockets = draft.signingSecret ? false : draft.websockets;
   }
   if (draft.testModel !== undefined && section === 'openai-compatibility') {
     const testModel = draft.testModel.trim();
@@ -975,6 +981,9 @@ export function ApiAccessPage() {
         target: 'models',
         error: t('apiAccess.error.fetchModelsBeforeSave'),
       };
+    }
+    if (preparedDraft.signingSecret && (!preparedDraft.signingSecret.trim() || !preparedDraft.baseUrl.trim() || parsedApiKeys.length !== 1)) {
+      return { saved: false, target: 'form', error: t('apiAccess.monkeycode.credentialsRequired') };
     }
     if (Array.from(preparedDraft.remark.trim()).length > 80 || /[\u0000-\u001f\u007f]/.test(preparedDraft.remark)) {
       return { saved: false, target: 'form', error: t('apiAccess.error.remarkInvalid') };
@@ -1390,6 +1399,7 @@ function ProviderHealthDialog({ row, onClose }: ProviderHealthDialogProps) {
     authIndex: row.authIndex,
     customHeaders: providerHeadersFromRecord(row.record),
     timeoutMs: PROVIDER_HEALTH_TIMEOUT_MS,
+    signingSecret: readString(row.record, 'signing_secret') || undefined,
   }), [row]);
 
   useEffect(() => {
@@ -1669,7 +1679,7 @@ export function ApiProviderDialog({
   ), [modelOptions, selectedModelNames]);
 
   const updateTextField = (
-    field: 'apiKey' | 'remark' | 'baseUrl' | 'priority' | 'prefix' | 'headersText' | 'excludedModelsText' | 'testModel' | 'cloakMode' | 'cloakSensitiveWordsText',
+    field: 'apiKey' | 'remark' | 'baseUrl' | 'priority' | 'prefix' | 'headersText' | 'excludedModelsText' | 'testModel' | 'cloakMode' | 'cloakSensitiveWordsText' | 'signingSecret',
     value: string,
   ) => {
     setFormError('');
@@ -1978,6 +1988,13 @@ export function ApiProviderDialog({
         <details className="provider-advanced-settings">
           <summary>{t('apiAccess.advanced')}</summary>
           <div className="provider-advanced-fields">
+            {activeSection !== 'gemini-api-key' ? (
+              <label>
+                <span>MonkeyCode · signing_secret</span>
+                <input type="password" autoComplete="new-password" spellCheck={false} value={draft.signingSecret ?? ''} onChange={(event) => updateTextField('signingSecret', event.currentTarget.value)} placeholder="omas_..." />
+                <small>{t('apiAccess.monkeycode.secretHint')}</small>
+              </label>
+            ) : null}
             <label><span>{t('apiAccess.field.prefix')}</span><input value={draft.prefix ?? ''} onChange={(event) => updateTextField('prefix', event.currentTarget.value)} placeholder={t('apiAccess.prefixPlaceholder')} /></label>
             <label className="multiline-field">
               <span>{t('apiAccess.field.headers')}</span>
@@ -2020,7 +2037,7 @@ export function ApiProviderDialog({
             {activeSection === 'codex-api-key' ? (
               <div className="provider-advanced-toggle">
                 <div><strong>WebSocket</strong><span>{t('apiAccess.websocket.description')}</span></div>
-                <label className="switch-control" title={t('apiAccess.websocket.enable')}><input type="checkbox" checked={Boolean(draft.websockets)} onChange={(event) => updateBooleanField('websockets', event.currentTarget.checked)} /><span className="switch-track" /></label>
+                <label className="switch-control" title={t('apiAccess.websocket.enable')}><input type="checkbox" disabled={Boolean(draft.signingSecret)} checked={!draft.signingSecret && Boolean(draft.websockets)} onChange={(event) => updateBooleanField('websockets', event.currentTarget.checked)} /><span className="switch-track" /></label>
               </div>
             ) : null}
             <div className="provider-advanced-toggle">
