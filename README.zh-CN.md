@@ -87,8 +87,10 @@ API 接入页面按照协议或 Provider 管理上游 API 凭证和服务地址�
 API Key 和明确的 Base URL，沿用对应协议的 URL 格式：OpenAI/Codex 通常以 `/v1` 结尾，
 Claude 填服务根地址。选择上游实际支持的模型；不支持模型发现时可手动添加。
 
-仍由随应用下载的原版 CLIProxyAPI 完成协议转换，应用内的本地转发层仅对最终请求中的
+仍由随应用下载的原版 CLIProxyAPI 完成协议转换，应用内的本地转发层对最终请求中的
 system prompt 计算 HMAC-SHA256 签名，并流式转发响应。保留原有协议与请求体。
+经过该转发层的请求会移除 URL 中的全部查询参数（包括内核自动添加的 `beta=true`），
+再发往 MonkeyCode 上游。
 签名支持 HTTP/SSE；启用后关闭 Codex WebSocket。请求需包含非空 system prompt，
 健康检查会按对应协议加入测试 prompt 并签名。
 

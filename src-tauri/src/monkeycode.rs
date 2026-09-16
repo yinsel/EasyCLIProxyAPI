@@ -455,11 +455,8 @@ async fn forward_with_config(request: Request, config: Value) -> Result<Response
     } else {
         endpoint.strip_prefix("/v1").unwrap_or(&endpoint)
     };
-    let mut target = format!("{}{suffix}", upstream.trim_end_matches('/'));
-    if let Some(query) = request.uri().query() {
-        target.push('?');
-        target.push_str(query);
-    }
+    // MonkeyCode rejects query parameters such as CPA's beta=true. Forward only the path.
+    let target = format!("{}{suffix}", upstream.trim_end_matches('/'));
     let (parts, body) = request.into_parts();
     if parts
         .headers
@@ -688,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwards_each_protocol_without_changing_path_body_or_prompt() {
+    async fn strips_all_query_parameters_preserving_each_protocol_path_body_and_prompt() {
         for (section, base_suffix, endpoint, body, auth_header, auth_value) in [
             (
                 "openai-compatibility",
@@ -718,7 +715,7 @@ mod tests {
             let raw = body.to_string();
             let expected_body = raw.clone();
             let expected_signature = signature(raw.as_bytes(), "omas_test_secret").unwrap();
-            let expected_path = format!("/custom{endpoint}?beta=true");
+            let expected_path = format!("/custom{endpoint}");
             let upstream = Router::new().fallback(move |request: Request| {
                 let expected_body = expected_body.clone();
                 let expected_signature = expected_signature.clone();
@@ -753,7 +750,9 @@ mod tests {
             config[section] = json!([record]);
             let request = Request::builder()
                 .method("POST")
-                .uri(format!("/monkeycode/{id}{endpoint}?beta=true"))
+                .uri(format!(
+                    "/monkeycode/{id}{endpoint}?beta=true&trace=1&tag=a&tag=b&empty=&encoded=a%26b"
+                ))
                 .header(auth_header, auth_value)
                 .header(META_HEADER, "must-not-leak")
                 .body(Body::from(raw))

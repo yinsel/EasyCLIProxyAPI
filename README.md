@@ -100,7 +100,9 @@ by that upstream, or add their names manually if model discovery is unavailable.
 
 The bundled stock CLIProxyAPI still handles protocol conversion. An in-process loopback
 bridge signs the final outgoing system prompt with HMAC-SHA256 and streams the response.
-The original protocol and request body are preserved. HTTP/SSE is supported; signing disables
+The original protocol and request body are preserved. The bridge removes all URL query
+parameters, including the core's automatic `beta=true`, before forwarding to MonkeyCode.
+HTTP/SSE is supported; signing disables
 Codex WebSocket transport. Requests need a non-empty system prompt, and health checks include
 one in the appropriate protocol format.
 
