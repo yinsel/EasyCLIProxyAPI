@@ -62,7 +62,7 @@ function downloadSourceLabel(source: VersionDownloadSource, t: ReturnType<typeof
 }
 
 export type MessageType = 'info' | 'success' | 'error';
-const APP_RELEASE_URL = 'https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest';
+const APP_RELEASE_URL = 'https://github.com/yinsel/EasyCLIProxyAPI/releases/latest';
 export const DEFAULT_VERSION_DOWNLOAD_SOURCE = 'github';
 const recordVersionManagementVisit = createVersionManagementVisitTracker();
 

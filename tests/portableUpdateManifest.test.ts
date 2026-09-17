@@ -39,7 +39,7 @@ test('macOS manifest CLI publishes both update channels', async () => {
       '--platform',
       'darwin',
       '--repository',
-      'router-for-me/EasyCLIProxyAPI',
+      'yinsel/EasyCLIProxyAPI',
       '--tag',
       'v1.2.3',
     ], { encoding: 'utf8' });
@@ -77,7 +77,7 @@ describe('Windows 便携更新清单', () => {
       const manifest = await generatePortableUpdateManifest({
         directory: root,
         output,
-        repository: 'router-for-me/EasyCLIProxyAPI',
+        repository: 'yinsel/EasyCLIProxyAPI',
         gitcodeRepository: 'mirror-owner/EasyCLIProxyAPI',
         tag: 'v1.2.3',
         publishedAt: '2026-07-24T00:00:00.000Z',
@@ -88,7 +88,7 @@ describe('Windows 便携更新清单', () => {
       for (const arch of ['amd64', 'aarch64'] as const) {
         const asset = manifest.assets[`windows-${arch}`];
         expect(asset.url).toBe(
-          `https://github.com/router-for-me/EasyCLIProxyAPI/releases/download/v1.2.3/EasyCLIProxyAPI-v1.2.3-Windows-${arch}.zip`,
+          `https://github.com/yinsel/EasyCLIProxyAPI/releases/download/v1.2.3/EasyCLIProxyAPI-v1.2.3-Windows-${arch}.zip`,
         );
         expect(asset.fallbackUrls).toEqual([
           `https://api.gitcode.com/api/v5/repos/mirror-owner/EasyCLIProxyAPI/releases/v1.2.3/attach_files/EasyCLIProxyAPI-v1.2.3-Windows-${arch}.zip/download`,
@@ -112,7 +112,7 @@ describe('Windows 便携更新清单', () => {
       await expect(generatePortableUpdateManifest({
         directory: root,
         output: join(root, 'portable-update-windows.json'),
-        repository: 'router-for-me/EasyCLIProxyAPI',
+        repository: 'yinsel/EasyCLIProxyAPI',
         tag: 'v1.2.3',
       })).rejects.toThrow();
     } finally {
@@ -139,7 +139,7 @@ describe('跨平台便携更新清单', () => {
       const manifest = await generatePortableUpdateManifest({
         directory: root,
         platform,
-        repository: 'router-for-me/EasyCLIProxyAPI',
+        repository: 'yinsel/EasyCLIProxyAPI',
         tag: 'v1.2.3',
         publishedAt: '2026-08-10T00:00:00.000Z',
       });

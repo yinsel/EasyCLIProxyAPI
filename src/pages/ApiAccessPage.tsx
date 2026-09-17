@@ -1990,7 +1990,7 @@ export function ApiProviderDialog({
           <div className="provider-advanced-fields">
             {activeSection !== 'gemini-api-key' ? (
               <label>
-                <span>MonkeyCode · signing_secret</span>
+                <span>MonkeyCode 支持</span>
                 <input type="password" autoComplete="new-password" spellCheck={false} value={draft.signingSecret ?? ''} onChange={(event) => updateTextField('signingSecret', event.currentTarget.value)} placeholder="omas_..." />
                 <small>{t('apiAccess.monkeycode.secretHint')}</small>
               </label>

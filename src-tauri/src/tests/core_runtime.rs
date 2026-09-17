@@ -691,8 +691,8 @@ fn selected_source_archive_and_checksums_are_copied_into_the_installation() {
 #[test]
 fn release_page_assets_parse_download_links_and_sha256() {
     let html = r#"
-          <li><a href="/router-for-me/CLIProxyAPI/releases/download/v1.2.3/checksums.txt">checksums.txt</a></li>
-          <li><a href="/router-for-me/CLIProxyAPI/releases/download/v1.2.3/CLIProxyAPI_1.2.3_linux_amd64.tar.gz">asset</a>
+          <li><a href="/yinsel/CLIProxyAPI/releases/download/v1.2.3/checksums.txt">checksums.txt</a></li>
+          <li><a href="/yinsel/CLIProxyAPI/releases/download/v1.2.3/CLIProxyAPI_1.2.3_linux_amd64.tar.gz">asset</a>
             <span>sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef</span>
           </li>
         "#;

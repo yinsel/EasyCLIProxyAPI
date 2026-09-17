@@ -16,13 +16,13 @@ describe('MonkeyCode advanced settings', () => {
     it(`offers optional masked signing_secret for ${category}`, () => {
       const html = renderDialog(category);
       const advanced = html.slice(html.indexOf('provider-advanced-settings'));
-      expect(advanced).toContain('signing_secret');
+      expect(advanced).toContain('MonkeyCode 支持');
       expect(advanced).toContain('type="password"');
       expect(advanced).toContain('placeholder="omas_..."');
       expect(advanced).not.toContain('monkeycode.png');
     });
   }
   it('does not offer MonkeyCode signing for Gemini', () => {
-    expect(renderDialog('gemini-api-key')).not.toContain('signing_secret');
+    expect(renderDialog('gemini-api-key')).not.toContain('MonkeyCode 支持');
   });
 });

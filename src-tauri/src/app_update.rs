@@ -420,7 +420,7 @@ pub(crate) fn validate_portable_update_manifest(
         || release_url.fragment().is_some()
         || !release_url
             .path()
-            .starts_with("/router-for-me/EasyCLIProxyAPI/releases/tag/v")
+            .starts_with("/yinsel/EasyCLIProxyAPI/releases/tag/v")
     {
         return Err("软件更新发布地址不受信任".to_string());
     }

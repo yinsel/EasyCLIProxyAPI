@@ -6,7 +6,7 @@ fn release_atom_parser_reads_first_release_tag() {
     let xml = r#"
           <feed>
             <entry>
-              <link href="https://github.com/router-for-me/CLIProxyAPI/releases/tag/v7.2.80"/>
+              <link href="https://github.com/yinsel/CLIProxyAPI/releases/tag/v7.2.80"/>
               <title>v7.2.80</title>
             </entry>
             <entry><title>v7.2.79</title></entry>
@@ -80,7 +80,7 @@ fn portable_update_test_manifest(version: &str) -> PortableUpdateManifest {
         version: version.to_string(),
         published_at: "2026-07-24T00:00:00.000Z".to_string(),
         release_url: format!(
-            "https://github.com/router-for-me/EasyCLIProxyAPI/releases/tag/v{version}"
+            "https://github.com/yinsel/EasyCLIProxyAPI/releases/tag/v{version}"
         ),
         assets: [
             (
@@ -160,7 +160,7 @@ fn portable_update_manifest_requires_both_matching_github_assets() {
             .assets
             .get_mut(&format!("{platform}-amd64"))
             .unwrap()
-            .url = "https://github.com.example.invalid/router-for-me/EasyCLIProxyAPI/releases/download/v1.2.3/update.zip".to_string();
+            .url = "https://github.com.example.invalid/yinsel/EasyCLIProxyAPI/releases/download/v1.2.3/update.zip".to_string();
     assert!(validate_portable_update_manifest(&foreign_host).is_err());
 
     let mut mismatched_tag = portable_update_test_manifest("1.2.3");
@@ -673,7 +673,7 @@ fn synthetic_release_uses_official_asset_names_and_urls() {
     assert_eq!(asset.name, "CLIProxyAPI_7.2.80_linux_amd64.tar.gz");
     assert_eq!(
             asset.browser_download_url,
-            "https://github.com/router-for-me/CLIProxyAPI/releases/download/v7.2.80/CLIProxyAPI_7.2.80_linux_amd64.tar.gz"
+            "https://github.com/yinsel/CLIProxyAPI/releases/download/v7.2.80/CLIProxyAPI_7.2.80_linux_amd64.tar.gz"
         );
 }
 
@@ -696,7 +696,7 @@ fn synthetic_core_release_uses_gitcode_as_download_fallback() {
 
     assert_eq!(
             asset.browser_download_url,
-            "https://github.com/router-for-me/CLIProxyAPI/releases/download/v7.2.80/CLIProxyAPI_7.2.80_windows_amd64.zip"
+            "https://github.com/yinsel/CLIProxyAPI/releases/download/v7.2.80/CLIProxyAPI_7.2.80_windows_amd64.zip"
         );
     assert_eq!(
             asset.fallback_download_urls,
@@ -722,7 +722,7 @@ fn gitcode_discovered_core_release_downloads_from_gitcode_first() {
         );
     assert_eq!(
         asset.fallback_download_urls,
-        ["https://github.com/router-for-me/CLIProxyAPI/releases/download/v7.2.80/CLIProxyAPI_7.2.80_linux_aarch64.tar.gz"]
+        ["https://github.com/yinsel/CLIProxyAPI/releases/download/v7.2.80/CLIProxyAPI_7.2.80_linux_aarch64.tar.gz"]
     );
 }
 

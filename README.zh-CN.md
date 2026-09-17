@@ -141,7 +141,7 @@ system prompt 计算 HMAC-SHA256 签名，并流式转发响应。保留原有�
 
 ## 快速开始
 
-1. 前往 [GitHub Releases](https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest)
+1. 前往 [GitHub Releases](https://github.com/yinsel/EasyCLIProxyAPI/releases/latest)
    下载对应操作系统的发行包。
 2. 解压 Windows 或 Linux 压缩包，macOS 用户打开 DMG。
 3. 启动 EasyCLIProxyAPI。

@@ -115,7 +115,7 @@ OpenAI、Claude、Gemini、およびその他の互換形式の間で変換で�
 
 ## クイックスタート
 
-1. [GitHub Releases](https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest)
+1. [GitHub Releases](https://github.com/yinsel/EasyCLIProxyAPI/releases/latest)
    から、お使いの OS に対応するパッケージをダウンロードします。
 2. Windows または Linux のアーカイブを展開します。macOS では DMG を開きます。
 3. EasyCLIProxyAPI を起動します。

@@ -157,7 +157,7 @@ previous configuration.
 ## Quick Start
 
 1. Download the package for your operating system from
-   [GitHub Releases](https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest).
+   [GitHub Releases](https://github.com/yinsel/EasyCLIProxyAPI/releases/latest).
 2. Extract the Windows or Linux archive, or open the macOS DMG.
 3. Launch EasyCLIProxyAPI.
 4. Open **Version Management** and install the bundled or latest CLIProxyAPI core.
