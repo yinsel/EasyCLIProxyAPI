@@ -13,7 +13,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{sync::OnceLock, time::Duration};
+use std::{borrow::Cow, sync::OnceLock, time::Duration};
 
 const META_HEADER: &str = "X-EasyCLI-MonkeyCode";
 const SIGNATURE_HEADER: &str = "x-ohmyagent-signature";
@@ -342,6 +342,35 @@ pub(crate) fn signature(body: &[u8], secret: &str) -> Result<String, String> {
     Ok(format!("v1={:x}", mac.finalize().into_bytes()))
 }
 
+// Codex may replay reasoning items with content:null on subsequent turns.
+// Strict Responses upstreams require an array when content is present. Keep
+// the item (including its summary/encrypted_content) and normalize only null.
+pub(crate) fn prepare_body<'a>(path: &str, body: &'a [u8]) -> Result<Cow<'a, [u8]>, String> {
+    if !path.ends_with("/responses") && !path.ends_with("/responses/compact") {
+        return Ok(Cow::Borrowed(body));
+    }
+    let mut payload: Value =
+        serde_json::from_slice(body).map_err(|_| "Invalid MonkeyCode Responses JSON")?;
+    let mut changed = false;
+    if let Some(items) = payload.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("reasoning")
+                && item.get("content").is_some_and(Value::is_null)
+            {
+                item["content"] = json!([]);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        serde_json::to_vec(&payload)
+            .map(Cow::Owned)
+            .map_err(|_| "Cannot encode MonkeyCode Responses JSON".into())
+    } else {
+        Ok(Cow::Borrowed(body))
+    }
+}
+
 fn strip_private_headers(headers: &mut HeaderMap) {
     let connection_headers: Vec<String> = headers
         .get_all("connection")
@@ -479,6 +508,8 @@ async fn forward_with_config(request: Request, config: Value) -> Result<Response
         })?;
     let mut headers = parts.headers;
     strip_private_headers(&mut headers);
+    let body = prepare_body(&endpoint, &body)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid MonkeyCode Responses JSON"))?;
     if post {
         let signed = signature(&body, record["signing_secret"].as_str().unwrap_or_default())
             .map_err(|_| {
@@ -525,7 +556,7 @@ async fn forward_with_config(request: Request, config: Value) -> Result<Response
         client
             .request(parts.method, target)
             .headers(headers)
-            .body(body)
+            .body(body.into_owned())
             .send(),
     )
     .await
@@ -548,6 +579,162 @@ async fn forward_with_config(request: Request, config: Value) -> Result<Response
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_normalization_preserves_history_and_signature() {
+        let body = json!({
+            "instructions": "Keep the system prompt unchanged.",
+            "input": [
+                {"role":"user", "content":"first turn"},
+                {"type":"reasoning", "id":"rs_1", "content":null,
+                    "summary":[{"type":"summary_text", "text":"Plan"}],
+                    "encrypted_content":"opaque-reasoning"},
+                {"type":"reasoning", "content":[{"type":"reasoning_text", "text":"Keep"}]},
+                {"type":"reasoning", "id":"rs_2", "summary":[]},
+                {"type":"function_call", "call_id":"call_1", "name":"read_file", "arguments":"{}"},
+                {"type":"function_call_output", "call_id":"call_1", "output":"file text", "content":null},
+                {"role":"user", "content":"second turn"}
+            ]
+        });
+        let raw = body.to_string();
+        let mut expected = body;
+        expected["input"][1]["content"] = json!([]);
+        for endpoint in ["/v1/responses", "/custom/v1/responses/compact"] {
+            let normalized = prepare_body(endpoint, raw.as_bytes()).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&normalized).unwrap(),
+                expected
+            );
+            assert_eq!(
+                signature(&normalized, "omas_test_secret").unwrap(),
+                signature(raw.as_bytes(), "omas_test_secret").unwrap()
+            );
+            // Repeated normalization does not rewrite a valid request.
+            assert!(matches!(
+                prepare_body(endpoint, &normalized).unwrap(),
+                Cow::Borrowed(_)
+            ));
+        }
+        for endpoint in ["/v1/chat/completions", "/v1/messages", "/v1/models"] {
+            assert_eq!(
+                prepare_body(endpoint, raw.as_bytes()).unwrap().as_ref(),
+                raw.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn responses_without_null_reasoning_content_keep_original_bytes() {
+        for raw in [
+            r#"{ "instructions":"hi", "input":[] }"#,
+            r#"{ "input":[{"type":"reasoning","summary":[]}] }"#,
+            r#"{ "input":[{"type":"reasoning","content":[]}] }"#,
+            r#"{ "input":[{"type":"reasoning","content":"invalid but not null"}] }"#,
+            r#"{ "input":[{"role":"assistant","content":null},null] }"#,
+            r#"{ "input":"text" }"#,
+        ] {
+            let normalized = prepare_body("/v1/responses", raw.as_bytes()).unwrap();
+            assert!(matches!(normalized, Cow::Borrowed(_)));
+            assert_eq!(normalized.as_ref(), raw.as_bytes());
+        }
+        assert!(prepare_body("/v1/responses", b"not json").is_err());
+    }
+
+    #[tokio::test]
+    async fn codex_second_turn_replays_reasoning_through_signed_bridge() {
+        // Simulate a Responses upstream that emits null but strictly requires
+        // an array when the same reasoning item is replayed in the next input.
+        #[derive(Deserialize)]
+        struct StrictReasoning {
+            content: Vec<Value>,
+        }
+        let output = json!([
+            {"type":"reasoning", "id":"rs_test", "content":null,
+                "summary":[], "encrypted_content":"opaque-test"},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text","text":"Hello"}]}
+        ]);
+        let completion =
+            json!({"type":"response.completed", "response":{"id":"resp_test", "output":output}});
+        let sse = format!("data: {completion}\n\n");
+        let upstream_sse = sse.clone();
+        let upstream = Router::new().fallback(move |request: Request| {
+            let sse = upstream_sse.clone();
+            async move {
+                assert_eq!(request.uri().to_string(), "/v1/responses");
+                assert_eq!(request.headers()["x-api-key"], "oma_test");
+                let supplied = request.headers()[SIGNATURE_HEADER]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                let content_length = request.headers()["content-length"]
+                    .to_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let body = to_bytes(request.into_body(), MAX_BODY).await.unwrap();
+                assert_eq!(body.len(), content_length);
+                assert_eq!(signature(&body, "omas_test_secret").unwrap(), supplied);
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+                for item in payload["input"].as_array().unwrap() {
+                    if item["type"] == "reasoning" {
+                        let Ok(reasoning) = serde_json::from_value::<StrictReasoning>(item.clone())
+                        else {
+                            return (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                "content: invalid type: null, expected a sequence",
+                            )
+                                .into_response();
+                        };
+                        assert!(reasoning.content.is_empty());
+                        assert_eq!(item["encrypted_content"], "opaque-test");
+                    }
+                }
+                ([("content-type", "text/event-stream")], sse).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut record = json!({"api-key":"oma_test", "base-url":format!("http://{address}/v1"), "signing_secret":"omas_test_secret"});
+        let id = route_id(&record, "codex-api-key");
+        encode_record(&mut record, "http://127.0.0.1:1", "codex-api-key").unwrap();
+        let config = json!({"codex-api-key":[record]});
+        let mut payload = json!({"instructions":"You are a helpful assistant.", "stream":true,
+            "input":[{"role":"user", "content":"Hello"}]});
+        for turn in 0..2 {
+            let raw = payload.to_string();
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/monkeycode/{id}/v1/responses?beta=true"))
+                .header("authorization", "Bearer oma_test")
+                .header("content-type", "application/json")
+                .header("content-length", raw.len())
+                .body(Body::from(raw))
+                .unwrap();
+            let response = forward_with_config(request, config.clone()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "turn {}", turn + 1);
+            let bytes = to_bytes(response.into_body(), MAX_BODY).await.unwrap();
+            assert_eq!(bytes.as_ref(), sse.as_bytes());
+            if turn == 0 {
+                let event = std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .strip_prefix("data: ")
+                    .unwrap()
+                    .trim();
+                let event: Value = serde_json::from_str(event).unwrap();
+                let history = payload["input"].as_array_mut().unwrap();
+                history.extend(
+                    event["response"]["output"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .cloned(),
+                );
+                history.push(json!({"role":"user", "content":"Continue"}));
+            }
+        }
+        server.abort();
+    }
 
     fn provider(upstream: &str) -> Value {
         json!({"name":"test", "base-url":upstream,

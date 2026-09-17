@@ -341,8 +341,12 @@ pub(crate) async fn provider_health_probe(
     }
 
     let started_at = Instant::now();
+    let mut body = std::borrow::Cow::Borrowed(request.data.as_bytes());
     if let Some(secret) = &request.signing_secret {
-        let signature = crate::monkeycode::signature(request.data.as_bytes(), secret)?;
+        body = crate::monkeycode::prepare_body(url.path(), request.data.as_bytes())?;
+        let signature = crate::monkeycode::signature(&body, secret)?;
+        // Let reqwest calculate the length of the normalized body.
+        headers.remove(reqwest::header::CONTENT_LENGTH);
         headers.insert(
             "x-ohmyagent-signature",
             signature.parse().map_err(|_| "Invalid signature")?,
@@ -351,7 +355,7 @@ pub(crate) async fn provider_health_probe(
     let response = client
         .post(url)
         .headers(headers)
-        .body(request.data.clone())
+        .body(body.into_owned())
         .send()
         .await
         .map_err(|error| format!("健康检测请求失败: {error}"))?;
