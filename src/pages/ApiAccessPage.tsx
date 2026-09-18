@@ -761,6 +761,21 @@ export const resolveProviderRecordIndex = (
   return primaryMatches.length === 1 ? primaryMatches[0].index : -1;
 };
 
+export const deleteProviderRecord = async (row: ProviderRecordIdentity) => {
+  const path = `/${row.section}`;
+  const records = responseList(await managementApi.get(path), row.section);
+  const matches = records
+    .map((record, index) => ({ record, index }))
+    .filter(({ record }) => providerIdentityMatches(row, record));
+  // Do not fall back to a stale index or an API key shared by another endpoint.
+  if (matches.length !== 1) {
+    throw new Error(translate(getCurrentLocale(), 'apiAccess.error.stale'));
+  }
+  // MonkeyCode restores the upstream URL for display, while the core stores a
+  // loopback bridge URL. Delete by the freshly resolved index, not the UI URL.
+  await managementApi.delete(path, { query: { index: matches[0].index } });
+};
+
 export const reorderProviderRecords = (
   records: Record<string, unknown>[],
   scopeRows: ProviderRecordIdentity[],
@@ -1094,13 +1109,7 @@ export function ApiAccessPage() {
     setBusy(true);
     setError('');
     try {
-      if (definitionFor(row.section).openAi) {
-        await managementApi.delete('/openai-compatibility', { query: { name: row.name } });
-      } else {
-        await managementApi.delete(`/${row.section}`, {
-          query: { 'api-key': row.apiKey, 'base-url': row.baseUrl },
-        });
-      }
+      await deleteProviderRecord(row);
       await invoke('save_api_access_remark', {
         update: {
           providerSection: row.section,
