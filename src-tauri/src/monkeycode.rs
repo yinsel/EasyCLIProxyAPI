@@ -342,9 +342,8 @@ pub(crate) fn signature(body: &[u8], secret: &str) -> Result<String, String> {
     Ok(format!("v1={:x}", mac.finalize().into_bytes()))
 }
 
-// Codex may replay reasoning items with content:null on subsequent turns.
-// Strict Responses upstreams require an array when content is present. Keep
-// the item (including its summary/encrypted_content) and normalize only null.
+// Adapt Codex history for strict Responses schemas without discarding items:
+// normalize null reasoning content and supply search queries from a singular query.
 pub(crate) fn prepare_body<'a>(path: &str, body: &'a [u8]) -> Result<Cow<'a, [u8]>, String> {
     if !path.ends_with("/responses") && !path.ends_with("/responses/compact") {
         return Ok(Cow::Borrowed(body));
@@ -359,6 +358,19 @@ pub(crate) fn prepare_body<'a>(path: &str, body: &'a [u8]) -> Result<Cow<'a, [u8
             {
                 item["content"] = json!([]);
                 changed = true;
+            }
+            if item.get("type").and_then(Value::as_str) == Some("web_search_call") {
+                if let Some(action) = item.get_mut("action").and_then(Value::as_object_mut) {
+                    if action.get("type").and_then(Value::as_str) == Some("search")
+                        && action.get("queries").is_none_or(Value::is_null)
+                    {
+                        if let Some(query) = action.get("query").and_then(Value::as_str) {
+                            let queries = json!([query]);
+                            action.insert("queries".into(), queries);
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -648,9 +660,15 @@ mod tests {
         struct StrictReasoning {
             content: Vec<Value>,
         }
+        #[derive(Deserialize)]
+        struct StrictSearch {
+            queries: Vec<String>,
+        }
         let output = json!([
             {"type":"reasoning", "id":"rs_test", "content":null,
                 "summary":[], "encrypted_content":"opaque-test"},
+            {"type":"web_search_call", "id":"ws_1", "status":"completed",
+                "action":{"type":"search", "query":"weather"}},
             {"type":"message", "role":"assistant", "content":[{"type":"output_text","text":"Hello"}]}
         ]);
         let completion =
@@ -676,6 +694,19 @@ mod tests {
                 assert_eq!(signature(&body, "omas_test_secret").unwrap(), supplied);
                 let payload: Value = serde_json::from_slice(&body).unwrap();
                 for item in payload["input"].as_array().unwrap() {
+                    if item["type"] == "web_search_call" {
+                        let Ok(search) =
+                            serde_json::from_value::<StrictSearch>(item["action"].clone())
+                        else {
+                            return (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                "input: missing field `queries`",
+                            )
+                                .into_response();
+                        };
+                        assert_eq!(search.queries, vec!["weather"]);
+                        assert_eq!(item["action"]["query"], "weather");
+                    }
                     if item["type"] == "reasoning" {
                         let Ok(reasoning) = serde_json::from_value::<StrictReasoning>(item.clone())
                         else {
@@ -734,6 +765,48 @@ mod tests {
             }
         }
         server.abort();
+    }
+
+    #[test]
+    fn responses_search_history() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/monkeycode-search-history.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let body =
+                json!({"instructions":"Preserve this prompt", "input":[case["item"].clone()]});
+            let expected =
+                json!({"instructions":"Preserve this prompt", "input":[case["expected"].clone()]});
+            let raw = body.to_string();
+            for path in [
+                "/v1/responses",
+                "/v1/responses/compact",
+                "/v1/messages",
+                "/v1/chat/completions",
+            ] {
+                let got = prepare_body(path, raw.as_bytes()).unwrap();
+                let want = if path == "/v1/messages" || path == "/v1/chat/completions" {
+                    &body
+                } else {
+                    &expected
+                };
+                assert_eq!(
+                    &serde_json::from_slice::<Value>(&got).unwrap(),
+                    want,
+                    "{}: {path}",
+                    case["name"]
+                );
+                assert!(matches!(
+                    prepare_body(path, &got).unwrap(),
+                    Cow::Borrowed(_)
+                ));
+                assert_eq!(
+                    signature(&got, "omas_test").unwrap(),
+                    signature(raw.as_bytes(), "omas_test").unwrap()
+                );
+            }
+        }
     }
 
     fn provider(upstream: &str) -> Value {

@@ -1,0 +1,294 @@
+[
+  {
+    "name": "singular query",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "天气 \"today\"\n\\ docs"
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "天气 \"today\"\n\\ docs",
+        "queries": [
+          "天气 \"today\"\n\\ docs"
+        ]
+      }
+    }
+  },
+  {
+    "name": "null queries",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "weather",
+        "queries": null
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "weather",
+        "queries": [
+          "weather"
+        ]
+      }
+    }
+  },
+  {
+    "name": "plural queries preserved",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "weather",
+        "queries": [
+          "weather",
+          "forecast"
+        ]
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "weather",
+        "queries": [
+          "weather",
+          "forecast"
+        ]
+      }
+    }
+  },
+  {
+    "name": "empty queries preserved",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "weather",
+        "queries": []
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "weather",
+        "queries": []
+      }
+    }
+  },
+  {
+    "name": "invalid queries not overwritten",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "weather",
+        "queries": "invalid"
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "weather",
+        "queries": "invalid"
+      }
+    }
+  },
+  {
+    "name": "missing query",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search"
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search"
+      }
+    }
+  },
+  {
+    "name": "null query",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": null
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": null
+      }
+    }
+  },
+  {
+    "name": "invalid query",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": [
+          "invalid"
+        ]
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": [
+          "invalid"
+        ]
+      }
+    }
+  },
+  {
+    "name": "empty singular query preserved",
+    "item": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": ""
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "",
+        "queries": [
+          ""
+        ]
+      }
+    }
+  },
+  {
+    "name": "open page unchanged",
+    "item": {
+      "type": "web_search_call",
+      "action": {
+        "type": "open_page",
+        "url": "https://example.com",
+        "query": "leave alone"
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "action": {
+        "type": "open_page",
+        "url": "https://example.com",
+        "query": "leave alone"
+      }
+    }
+  },
+  {
+    "name": "find unchanged",
+    "item": {
+      "type": "web_search_call",
+      "action": {
+        "type": "find_in_page",
+        "url": "https://example.com",
+        "pattern": "word"
+      }
+    },
+    "expected": {
+      "type": "web_search_call",
+      "action": {
+        "type": "find_in_page",
+        "url": "https://example.com",
+        "pattern": "word"
+      }
+    }
+  },
+  {
+    "name": "absent action",
+    "item": {
+      "type": "web_search_call",
+      "status": "completed"
+    },
+    "expected": {
+      "type": "web_search_call",
+      "status": "completed"
+    }
+  },
+  {
+    "name": "function arguments untouched",
+    "item": {
+      "type": "function_call",
+      "name": "web_search",
+      "arguments": "{\"query\":\"weather\"}"
+    },
+    "expected": {
+      "type": "function_call",
+      "name": "web_search",
+      "arguments": "{\"query\":\"weather\"}"
+    }
+  },
+  {
+    "name": "file search unchanged",
+    "item": {
+      "type": "file_search_call",
+      "queries": [
+        "weather"
+      ],
+      "status": "completed"
+    },
+    "expected": {
+      "type": "file_search_call",
+      "queries": [
+        "weather"
+      ],
+      "status": "completed"
+    }
+  }
+]
