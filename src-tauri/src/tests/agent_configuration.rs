@@ -689,10 +689,8 @@ fn claude_desktop_detects_windows_variant_config_directories() {
 #[test]
 fn claude_desktop_uses_linux_beta_config_paths() {
     let home = agent_test_home("claude-desktop-linux-paths");
-    let config_home = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(".config"));
+    // Tests isolate configuration from the runner's XDG_CONFIG_HOME.
+    let config_home = home.join(".config");
     let paths = claude_desktop_config_paths(&home);
 
     assert!(AgentClient::ClaudeDesktop.supported_platform());
@@ -2320,7 +2318,8 @@ fn agent_probe_command_stops_at_timeout() {
     #[cfg(not(target_os = "windows"))]
     let mut command = {
         let mut command = Command::new("sh");
-        command.args(["-c", "sleep 5"]);
+        // Keep the shell alive so its child also holds the output pipes.
+        command.args(["-c", "sleep 5 & wait"]);
         command
     };
 

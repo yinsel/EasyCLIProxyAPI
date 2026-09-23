@@ -2673,6 +2673,11 @@ pub(crate) fn command_output_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn()?;
     let mut stdout = child
         .stdout
@@ -2717,6 +2722,17 @@ pub(crate) fn command_output_with_timeout(
 }
 
 fn terminate_agent_probe_process(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // Descendants may inherit the pipes; killing only the shell leaves
+        // the output readers blocked beyond the probe timeout.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     #[cfg(target_os = "windows")]
     {
         let process_id = child.id().to_string();
