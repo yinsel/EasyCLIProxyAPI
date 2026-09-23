@@ -77,7 +77,7 @@ pub(crate) struct BackupPreview {
 pub(crate) fn agent_data_directory(paths: &[PathBuf]) -> Result<PathBuf, String> {
     #[cfg(test)]
     {
-        let temp = std::env::temp_dir();
+        let temp = crate::tests::test_temp_dir();
         let relative = paths
             .first()
             .ok_or("没有配置路径")?

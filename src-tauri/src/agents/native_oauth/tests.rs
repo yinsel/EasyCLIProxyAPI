@@ -3,7 +3,7 @@ use super::*;
 struct TestHome(PathBuf);
 impl TestHome {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::tests::test_temp_dir().join(format!(
             "cpa-native-oauth-{}-{}",
             std::process::id(),
             SystemTime::now()

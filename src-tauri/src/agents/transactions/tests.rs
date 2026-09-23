@@ -25,7 +25,7 @@ fn codex_model_merge_does_not_resurrect_removed_schema_fields() {
 
 #[test]
 fn mid_transaction_external_edit_is_preserved_while_earlier_writes_are_rolled_back() {
-    let home = std::env::temp_dir().join(format!("cpa-transaction-race-{}", std::process::id()));
+    let home = crate::tests::test_temp_dir().join(format!("cpa-transaction-race-{}", std::process::id()));
     fs::create_dir_all(&home).unwrap();
     let paths = vec![home.join("first.json"), home.join("second.json")];
     for path in &paths {
