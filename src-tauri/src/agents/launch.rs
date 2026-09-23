@@ -615,8 +615,9 @@ fn terminate_deepseek_harness_process_tree(child: &mut Child) -> Result<(), Stri
     #[cfg(unix)]
     {
         let process_group = format!("-{}", child.id());
+        // A negative process-group ID must not be parsed as a kill option.
         let term_status = Command::new("kill")
-            .args(["-TERM", &process_group])
+            .args(["-TERM", "--", &process_group])
             .status()
             .map_err(|error| format!("关闭 DeepSeek Harness 进程组失败: {error}"))?;
         if !term_status.success() {
@@ -635,7 +636,7 @@ fn terminate_deepseek_harness_process_tree(child: &mut Child) -> Result<(), Stri
             }
         }
         let kill_status = Command::new("kill")
-            .args(["-KILL", &process_group])
+            .args(["-KILL", "--", &process_group])
             .status()
             .map_err(|error| format!("强制关闭 DeepSeek Harness 进程组失败: {error}"))?;
         if !kill_status.success() {
@@ -1955,6 +1956,50 @@ class GuiHelper {
 
         stop_managed_deepseek_harness(&state).unwrap();
         assert!(!state.status().unwrap().running);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harness_process_group_shutdown_preserves_unrelated_processes() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        struct TestChild(Child);
+        impl Drop for TestChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        fn spawn(ignore_term: bool) -> TestChild {
+            let script = if ignore_term {
+                "trap '' TERM; printf 'ready\\n'; exec sleep 30"
+            } else {
+                "printf 'ready\\n'; exec sleep 30"
+            };
+            let mut child = TestChild(
+                Command::new("/bin/sh")
+                    .args(["-c", script])
+                    .process_group(0)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut ready = String::new();
+            io::BufReader::new(child.0.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            child
+        }
+
+        let mut unrelated = spawn(false);
+        for ignore_term in [false, true] {
+            let mut target = spawn(ignore_term);
+            terminate_deepseek_harness_process_tree(&mut target.0).unwrap();
+            assert!(target.0.try_wait().unwrap().is_some());
+            assert!(unrelated.0.try_wait().unwrap().is_none());
+        }
     }
 
     #[test]
