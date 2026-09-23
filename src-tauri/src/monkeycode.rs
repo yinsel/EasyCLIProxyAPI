@@ -358,8 +358,9 @@ pub(crate) fn signature(body: &[u8], secret: &str) -> Result<String, String> {
     Ok(format!("v1={:x}", mac.finalize().into_bytes()))
 }
 
-// Adapt Codex history for strict Responses schemas without discarding items:
-// normalize null reasoning content and supply search queries from a singular query.
+// Adapt Responses payloads before both signing and forwarding. MonkeyCode's
+// prompt parser requires an input array even when instructions is non-empty.
+// Preserve prompt bytes and history while normalizing compatible input shapes.
 pub(crate) fn prepare_body<'a>(path: &str, body: &'a [u8]) -> Result<Cow<'a, [u8]>, String> {
     if !path.ends_with("/responses") && !path.ends_with("/responses/compact") {
         return Ok(Cow::Borrowed(body));
@@ -367,6 +368,14 @@ pub(crate) fn prepare_body<'a>(path: &str, body: &'a [u8]) -> Result<Cow<'a, [u8
     let mut payload: Value =
         serde_json::from_slice(body).map_err(|_| "Invalid MonkeyCode Responses JSON")?;
     let mut changed = false;
+    if let Some(text) = payload.get("input").and_then(Value::as_str) {
+        payload["input"] = json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        }]);
+        changed = true;
+    }
     if let Some(items) = payload.get_mut("input").and_then(Value::as_array_mut) {
         for item in items {
             if item.get("type").and_then(Value::as_str) == Some("reasoning")
@@ -540,11 +549,15 @@ async fn forward_with_config(request: Request, config: Value) -> Result<Response
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid MonkeyCode Responses JSON"))?;
     if post {
         let signed = signature(&body, record["signing_secret"].as_str().unwrap_or_default())
-            .map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "MonkeyCode requires a valid non-empty system prompt",
-                )
+            .map_err(|error| {
+                let message = match error.as_str() {
+                    "Invalid MonkeyCode prompt fields" =>
+                        "EasyCLI MonkeyCode bridge: invalid prompt field types; request was not sent upstream",
+                    "MonkeyCode requires a non-empty system prompt" =>
+                        "EasyCLI MonkeyCode bridge: missing non-empty system instructions; request was not sent upstream",
+                    _ => "EasyCLI MonkeyCode bridge: cannot sign request; request was not sent upstream",
+                };
+                (StatusCode::BAD_REQUEST, message)
             })?;
         headers.insert(
             SIGNATURE_HEADER,
@@ -652,20 +665,162 @@ mod tests {
     }
 
     #[test]
-    fn responses_without_null_reasoning_content_keep_original_bytes() {
+    fn already_compatible_responses_keep_original_bytes() {
         for raw in [
             r#"{ "instructions":"hi", "input":[] }"#,
             r#"{ "input":[{"type":"reasoning","summary":[]}] }"#,
             r#"{ "input":[{"type":"reasoning","content":[]}] }"#,
             r#"{ "input":[{"type":"reasoning","content":"invalid but not null"}] }"#,
             r#"{ "input":[{"role":"assistant","content":null},null] }"#,
-            r#"{ "input":"text" }"#,
         ] {
             let normalized = prepare_body("/v1/responses", raw.as_bytes()).unwrap();
             assert!(matches!(normalized, Cow::Borrowed(_)));
             assert_eq!(normalized.as_ref(), raw.as_bytes());
         }
         assert!(prepare_body("/v1/responses", b"not json").is_err());
+    }
+
+    #[test]
+    fn responses_string_input_is_normalized_without_inventing_instructions() {
+        for text in ["", "Hi", "first line\n第二行  "] {
+            let payload = json!({"input": text, "previous_response_id": "resp_previous"});
+            let raw = payload.to_string();
+            for path in ["/v1/responses", "/v1/responses/compact"] {
+                let body = prepare_body(path, raw.as_bytes()).unwrap();
+                let normalized: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    normalized["input"],
+                    json!([{
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    }])
+                );
+                assert_eq!(normalized["previous_response_id"], "resp_previous");
+                assert!(normalized.get("instructions").is_none());
+                assert_eq!(
+                    signature(&body, "omas_test_secret").unwrap_err(),
+                    "MonkeyCode requires a non-empty system prompt"
+                );
+                assert!(matches!(
+                    prepare_body(path, &body).unwrap(),
+                    Cow::Borrowed(_)
+                ));
+            }
+            assert_eq!(
+                prepare_body("/v1/chat/completions", raw.as_bytes())
+                    .unwrap()
+                    .as_ref(),
+                raw.as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_string_input_reaches_upstream_with_unchanged_prompt_signature() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let upstream = Router::new().fallback(move |request: Request| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                // Golden HMAC from an independent Node calculation, shared
+                // with signing_uses_full_secret_and_preserves_prompt_bytes.
+                assert_eq!(
+                    request.headers()[SIGNATURE_HEADER],
+                    "v1=b529b56a975dabea4b14956e84dbce9dd6c00dc3b6017e41a961899a9fa47a85"
+                );
+                assert!(!request.headers().contains_key(META_HEADER));
+                let bytes = to_bytes(request.into_body(), MAX_BODY).await.unwrap();
+                #[derive(Deserialize)]
+                struct StrictResponses {
+                    instructions: String,
+                    input: Vec<Value>,
+                }
+                let body: StrictResponses = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body.instructions, "你好\n  world ");
+                assert_eq!(body.input.len(), 1);
+                assert_eq!(body.input[0]["role"], "user");
+                assert_eq!(body.input[0]["content"][0]["text"], "first line\n第二行  ");
+                let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(payload["previous_response_id"], "resp_previous");
+                if payload["model"] == "upstream-reject" {
+                    return (StatusCode::BAD_REQUEST, "upstream-specific-error").into_response();
+                }
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: accepted\n\n",
+                )
+                    .into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut record = json!({"api-key":"oma_test", "base-url":format!("http://{address}/v1"), "signing_secret":"omas_test_secret"});
+        let id = route_id(&record, "codex-api-key");
+        encode_record(&mut record, "http://127.0.0.1:1", "codex-api-key").unwrap();
+        let config = json!({"codex-api-key":[record]});
+        let payload = json!({"instructions":"你好\n  world ", "input":"first line\n第二行  ",
+            "model":"test", "previous_response_id":"resp_previous", "stream":true});
+        let request = |path: &str, body: &Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/monkeycode/{id}{path}"))
+                .header("authorization", "Bearer oma_test")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for path in ["/v1/responses", "/v1/responses/compact"] {
+            let response = forward_with_config(request(path, &payload), config.clone())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), MAX_BODY)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"data: accepted\n\n"
+            );
+        }
+        for (body, expected) in [
+            (
+                json!({"input":"Hi"}),
+                "missing non-empty system instructions",
+            ),
+            (
+                json!({"instructions":"present", "input":42}),
+                "invalid prompt field types",
+            ),
+        ] {
+            let (status, message) =
+                forward_with_config(request("/v1/responses", &body), config.clone())
+                    .await
+                    .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains(expected));
+            assert!(message.contains("request was not sent upstream"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let mut rejected = payload;
+        rejected["model"] = json!("upstream-reject");
+        let response = forward_with_config(request("/v1/responses", &rejected), config)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            to_bytes(response.into_body(), MAX_BODY)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"upstream-specific-error"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.abort();
     }
 
     #[tokio::test]

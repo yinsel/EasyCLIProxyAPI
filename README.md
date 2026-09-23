@@ -100,11 +100,17 @@ by that upstream, or add their names manually if model discovery is unavailable.
 
 The bundled stock CLIProxyAPI still handles protocol conversion. An in-process loopback
 bridge signs the final outgoing system prompt with HMAC-SHA256 and streams the response.
-The original protocol and request body are preserved. The bridge removes all URL query
+The original protocol and prompt text are preserved. Responses string input is converted
+to an equivalent user-message array before signing and forwarding so MonkeyCode can
+parse it. Existing history normalization retains reasoning and search items. The bridge removes all URL query
 parameters, including the core's automatic `beta=true`, before forwarding to MonkeyCode.
 HTTP/SSE is supported; signing disables
 Codex WebSocket transport. Requests need a non-empty system prompt, and health checks include
 one in the appropriate protocol format.
+
+The bridge does not invent missing system instructions. Local prompt-validation errors
+start with `EasyCLI MonkeyCode bridge` and indicate that no upstream request was sent;
+errors returned by MonkeyCode itself retain the upstream status and response body.
 
 Keep the desktop app running. Local bridge addresses are refreshed before the core starts.
 Upstream proxy settings are honored. Credentials are stored in core configuration, with
