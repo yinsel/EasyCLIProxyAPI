@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn agent_test_home(name: &str) -> PathBuf {
-    let path = crate::tests::test_temp_dir().join(format!(
+    let path = std::env::temp_dir().join(format!(
         "cpa-gui-agent-{name}-{}-{}",
         std::process::id(),
         SystemTime::now()

@@ -3,7 +3,7 @@ use super::*;
 struct Home(PathBuf);
 impl Home {
     fn new() -> Self {
-        let path = crate::tests::test_temp_dir().join(format!(
+        let path = env::temp_dir().join(format!(
             "cpa-workbuddy-test-{}-{}",
             std::process::id(),
             SystemTime::now()
