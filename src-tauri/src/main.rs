@@ -13,6 +13,7 @@ mod desktop_theme;
 mod instance_lock;
 mod management_api;
 mod monkeycode;
+mod network_proxy;
 mod oauth_browser;
 mod progress;
 mod provider_health;
@@ -51,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -164,9 +165,11 @@ const PI_AGENT_SETTINGS_FILE: &str = "settings.json";
 const CODEX_MODEL_CATALOG_FILE: &str = "cpa-gui-model-catalog.json";
 const CODEX_OAUTH_LOGIN_REQUIRED_ERROR: &str = "CODEX_OAUTH_LOGIN_REQUIRED";
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000831700";
-const CLAUDE_DESKTOP_OPUS_MODEL_ID: &str = "claude-opus-5";
-const CLAUDE_DESKTOP_SONNET_MODEL_ID: &str = "claude-sonnet-4-6";
-const CLAUDE_DESKTOP_HAIKU_MODEL_ID: &str = "claude-haiku-4-5";
+const CLAUDE_DESKTOP_OPUS_MODEL_ID: &str = "claude-opus-5-cpa";
+const CLAUDE_DESKTOP_SONNET_MODEL_ID: &str = "claude-sonnet-5-cpa";
+const CLAUDE_DESKTOP_HAIKU_MODEL_ID: &str = "claude-haiku-4-5-cpa";
+const LEGACY_CLAUDE_DESKTOP_MODEL_IDS: [&str; 3] =
+    ["claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
 const MANAGED_CLAUDE_OPUS_ALIAS_DISPLAY_NAME: &str = "EasyCLIProxyAPI managed Claude Opus mapping";
 const MANAGED_CLAUDE_SONNET_ALIAS_DISPLAY_NAME: &str =
     "EasyCLIProxyAPI managed Claude Sonnet mapping";
@@ -434,6 +437,7 @@ struct CorePlatform {
 struct CoreStatus {
     installed: bool,
     running: bool,
+    ready: bool,
     starting: bool,
     managed: bool,
     process_id: Option<u32>,
@@ -457,6 +461,8 @@ struct AppUpdateInfo {
     latest_version: String,
     update_available: bool,
     release_url: String,
+    release_notes: HashMap<String, String>,
+    published_at: String,
     auto_update_supported: bool,
     download_size_bytes: Option<u64>,
     unsupported_reason: Option<String>,
@@ -469,6 +475,8 @@ struct PortableUpdateManifest {
     version: String,
     published_at: String,
     release_url: String,
+    #[serde(default, deserialize_with = "deserialize_release_notes")]
+    release_notes: HashMap<String, String>,
     assets: std::collections::HashMap<String, PortableUpdateAsset>,
     #[serde(default)]
     full_assets: Option<std::collections::HashMap<String, PortableUpdateAsset>>,
@@ -639,6 +647,7 @@ struct GuiConfigFile {
     plugins_enabled: bool,
     routing_strategy: String,
     proxy_url: String,
+    proxy_override: bool,
     download_source: VersionDownloadSource,
     custom_download_mirrors: Vec<String>,
     active_custom_download_mirror: String,
@@ -857,22 +866,36 @@ struct GuiApiKeyEntry {
 struct GuiApiAccessRemark {
     provider_section: String,
     api_key_hash: String,
+    #[serde(default)]
+    record_hash: String,
     remark: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiAccessRemarkLocator {
+    provider_name: String,
+    base_url: String,
+    api_keys: Vec<String>,
+    #[serde(default)]
+    config_identity: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiAccessRemarkQuery {
     provider_section: String,
-    api_keys: Vec<String>,
+    #[serde(flatten)]
+    locator: ApiAccessRemarkLocator,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiAccessRemarkUpdate {
     provider_section: String,
-    previous_api_keys: Vec<String>,
-    api_keys: Vec<String>,
+    previous_records: Vec<ApiAccessRemarkLocator>,
+    records: Vec<ApiAccessRemarkLocator>,
+    all_records: Vec<ApiAccessRemarkLocator>,
     remark: String,
 }
 
@@ -929,6 +952,7 @@ impl Default for GuiConfigFile {
             plugins_enabled: false,
             routing_strategy: "round-robin".to_string(),
             proxy_url: String::new(),
+            proxy_override: false,
             download_source: VersionDownloadSource::Github,
             custom_download_mirrors: Vec::new(),
             active_custom_download_mirror: String::new(),
@@ -970,6 +994,7 @@ struct GuiConfigPresence {
     plugins_enabled: Option<bool>,
     routing_strategy: Option<String>,
     proxy_url: Option<String>,
+    proxy_override: Option<bool>,
     download_source: Option<VersionDownloadSource>,
     custom_download_mirrors: Option<Vec<String>>,
     active_custom_download_mirror: Option<String>,
@@ -1128,8 +1153,13 @@ struct AgentModelOption {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaudeDesktopModelMappings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desktop_models: Option<Vec<ClaudeDesktopModelMapping>>,
+    #[serde(default)]
     opus: String,
+    #[serde(default)]
     sonnet: String,
+    #[serde(default)]
     haiku: String,
     #[serde(default)]
     opus_1m: bool,
@@ -1145,6 +1175,41 @@ struct ClaudeDesktopModelMappings {
     disable_auto_compact: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeDesktopModelMapping {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    alias: String,
+    #[serde(default)]
+    context_1m: bool,
+}
+
+impl ClaudeDesktopModelMapping {
+    fn model_id(&self) -> &str {
+        if self.alias.trim().is_empty() {
+            self.model.trim()
+        } else {
+            self.alias.trim()
+        }
+    }
+
+    fn source_or_alias(&self) -> &str {
+        if self.model.trim().is_empty() {
+            self.alias.trim()
+        } else {
+            self.model.trim()
+        }
+    }
+
+    fn has_mapping(&self) -> bool {
+        !self.model.trim().is_empty()
+            && !self.alias.trim().is_empty()
+            && !self.model.trim().eq_ignore_ascii_case(self.alias.trim())
+    }
+}
+
 fn default_claude_code_max_context_tokens() -> u64 {
     DEFAULT_CLAUDE_CONTEXT_WINDOW
 }
@@ -1156,6 +1221,7 @@ fn default_claude_auto_compact_pct() -> u8 {
 impl ClaudeDesktopModelMappings {
     fn all(model: &str) -> Self {
         Self {
+            desktop_models: None,
             opus: model.to_string(),
             sonnet: model.to_string(),
             haiku: model.to_string(),
@@ -1297,6 +1363,8 @@ enum AgentClient {
     Hermes,
     DeepSeekHarness,
     ZCode,
+    WorkBuddy,
+    AntigravityCli,
     KimiCode,
     GrokBuild,
 }
@@ -1319,6 +1387,8 @@ impl AgentClient {
             "hermes" => Ok(Self::Hermes),
             "deepseek-harness" => Ok(Self::DeepSeekHarness),
             "zcode" => Ok(Self::ZCode),
+            "workbuddy" => Ok(Self::WorkBuddy),
+            "antigravity-cli" => Ok(Self::AntigravityCli),
             "kimi-code" => Ok(Self::KimiCode),
             "grok-build" => Ok(Self::GrokBuild),
             _ => Err(format!("不支持的智能体客户端: {value}")),
@@ -1335,6 +1405,8 @@ impl AgentClient {
             Self::Hermes => "hermes",
             Self::DeepSeekHarness => "deepseek-harness",
             Self::ZCode => "zcode",
+            Self::WorkBuddy => "workbuddy",
+            Self::AntigravityCli => "antigravity-cli",
             Self::KimiCode => "kimi-code",
             Self::GrokBuild => "grok-build",
         }
@@ -1350,6 +1422,8 @@ impl AgentClient {
             Self::Hermes => "Hermes Agent",
             Self::DeepSeekHarness => "DeepSeek Harness",
             Self::ZCode => "ZCode",
+            Self::WorkBuddy => "WorkBuddy",
+            Self::AntigravityCli => "Antigravity CLI",
             Self::KimiCode => "Kimi Code",
             Self::GrokBuild => "Grok Build",
         }
@@ -1374,6 +1448,8 @@ impl AgentClient {
             Self::Hermes => &["hermes"],
             Self::DeepSeekHarness => &["dsh"],
             Self::ZCode => &["zcode"],
+            Self::WorkBuddy => &[],
+            Self::AntigravityCli => &["agy"],
             Self::KimiCode => &["kimi"],
             Self::GrokBuild => &["grok"],
         }
@@ -1398,7 +1474,6 @@ struct PreparedAgentModels {
     codex_catalog: Option<String>,
 }
 
-#[cfg(test)]
 type FileSnapshot = (PathBuf, Option<Vec<u8>>);
 #[cfg(test)]
 type AgentRecordExtension = (AgentModificationRecord, Vec<FileSnapshot>);
@@ -1415,7 +1490,6 @@ struct GuiNetworkSettings {
 struct GuiNetworkRoutingSettings {
     port: u16,
     allow_lan: bool,
-    proxy_url: String,
     routing_session_affinity: bool,
     routing_session_affinity_ttl: String,
     #[serde(default)]
@@ -1431,7 +1505,10 @@ struct GuiNetworkRoutingSettings {
 struct GuiNetworkEndpointSettings {
     host: String,
     port: u16,
-    proxy_url: String,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    proxy_override: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1532,6 +1609,7 @@ struct CoreConfigView {
     plugins_enabled: bool,
     routing_strategy: String,
     proxy_url: String,
+    proxy_override: bool,
     routing_session_affinity: bool,
     routing_session_affinity_ttl: String,
     disable_cooling: bool,
@@ -1917,6 +1995,7 @@ impl GuiConfigState {
             .map_err(|_| "GUI 配置状态锁已损坏".to_string())?;
         let mut config = current.clone();
         apply_core_settings_to_gui_config(&mut config, settings);
+        apply_external_core_proxy_override(&mut config, settings)?;
         sanitize_gui_config(&mut config)?;
         validate_gui_config(&config)?;
         *current = config.clone();
@@ -1955,6 +2034,7 @@ impl GuiConfigState {
             config.allow_lan = settings.allow_lan;
             config.port = settings.port;
             config.proxy_url = settings.proxy_url.clone();
+            config.proxy_override = settings.proxy_override;
             Ok(())
         })
     }
@@ -2085,13 +2165,29 @@ impl GuiConfigState {
     }
 
     fn sync_core_settings(&self, settings: &CoreConfigSettings) -> Result<GuiConfigFile, String> {
-        self.sync_core_settings_with_api_key(settings, None)
+        self.sync_core_settings_internal(settings, None, false)
+    }
+
+    fn sync_core_settings_external(
+        &self,
+        settings: &CoreConfigSettings,
+    ) -> Result<GuiConfigFile, String> {
+        self.sync_core_settings_internal(settings, None, true)
     }
 
     fn sync_core_settings_with_api_key(
         &self,
         settings: &CoreConfigSettings,
         added_api_key: Option<GuiApiKeyEntry>,
+    ) -> Result<GuiConfigFile, String> {
+        self.sync_core_settings_internal(settings, added_api_key, false)
+    }
+
+    fn sync_core_settings_internal(
+        &self,
+        settings: &CoreConfigSettings,
+        added_api_key: Option<GuiApiKeyEntry>,
+        apply_external_proxy: bool,
     ) -> Result<GuiConfigFile, String> {
         self.update(|config| {
             config.api_keys = merge_core_api_keys_with_gui_metadata(
@@ -2122,7 +2218,6 @@ impl GuiConfigState {
             }
             config.plugins_enabled = settings.plugins_enabled;
             config.routing_strategy = settings.routing_strategy.clone();
-            config.proxy_url = settings.proxy_url.clone();
             config.routing_session_affinity = settings.routing_session_affinity;
             config.routing_session_affinity_ttl = settings.routing_session_affinity_ttl.clone();
             config.disable_cooling = settings.disable_cooling;
@@ -2130,6 +2225,9 @@ impl GuiConfigState {
             config.max_retry_credentials = settings.max_retry_credentials;
             config.max_retry_interval = settings.max_retry_interval;
             config.streaming_bootstrap_retries = settings.streaming_bootstrap_retries;
+            if apply_external_proxy {
+                apply_external_core_proxy_override(config, settings)?;
+            }
             Ok(())
         })
     }
@@ -2220,6 +2318,7 @@ impl From<&GuiConfigFile> for CoreConfigView {
             plugins_enabled: config.plugins_enabled,
             routing_strategy: config.routing_strategy.clone(),
             proxy_url: config.proxy_url.clone(),
+            proxy_override: config.proxy_override,
             routing_session_affinity: config.routing_session_affinity,
             routing_session_affinity_ttl: config.routing_session_affinity_ttl.clone(),
             disable_cooling: config.disable_cooling,
@@ -2248,6 +2347,14 @@ struct GithubAsset {
 }
 
 fn main() {
+    let helper_args = env::args_os().collect::<Vec<_>>();
+    if antigravity_helper_requested(&helper_args) {
+        let code = run_antigravity_helper(&helper_args).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            1
+        });
+        std::process::exit(code);
+    }
     let mut args = env::args_os();
     while let Some(argument) = args.next() {
         if argument == "--portable-update-helper" {
@@ -2365,6 +2472,9 @@ fn main() {
 
     let app = app
         .setup(move |app| {
+            if let Err(error) = network_proxy::refresh(app.state::<GuiConfigState>().inner()) {
+                eprintln!("读取启动代理设置失败: {error}");
+            }
             if let Err(error) = codex_catalog::validate_embedded_catalog() {
                 eprintln!("Codex 内置模型目录无效: {error}");
             }
@@ -2399,6 +2509,7 @@ fn main() {
                 eprintln!("启动配置文件监控失败: {error}");
             }
 
+            network_proxy::start_monitor(app.handle().clone());
             start_codex_model_catalog_sync(app.handle().clone());
 
             let usage_app = app.handle().clone();
@@ -2599,7 +2710,10 @@ fn main() {
             usage::get_usage_analysis,
             usage::get_usage_events,
             usage::get_usage_pricing,
+            usage::get_usage_storage_settings,
             usage::repair_usage_cache_records,
+            usage::save_usage_storage_settings,
+            usage::shrink_usage_database,
             usage::save_usage_model_price,
             usage::delete_usage_model_price,
             usage::sync_usage_model_prices,

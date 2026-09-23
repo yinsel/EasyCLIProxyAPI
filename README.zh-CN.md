@@ -49,6 +49,8 @@ APIMart 是一个低成本的 AI 图像与视频生成 API 平台——GPT-Image
 
 每次启动软件时，软件和内核会各自在后台自动检查一次更新；之后每进入 **版本管理** 页面 5 次（第 5、10、15 次，以此类推）自动检查一次，也可随时通过各自的 **检查更新** 按钮手动检查。页面内部刷新不重复计数，重启软件后次数归零。修改下载源不会自动检查更新，重新进入页面也会保留已保存的下载源。检查不会自动下载或安装更新。
 
+**版本管理** 页面同时展示当前界面语言的最新版软件更新说明，升级后仍可查看。发布者在 [`docs/release-notes/`](docs/release-notes/README.md) 中按版本分别编辑简体中文、繁体中文、英文和日文 Markdown，CI 生成的 GitHub Release 正文仅按英文、简体中文的顺序展示，应用更新清单保留四种语言中已编写的正文。当前语言的说明缺失时直接提示，不回退到其他语言。
+
 ### OAuth 账号授权
 
 ![OAuth 账号授权](docs/screenshots/zh-CN/2.png)
@@ -125,11 +127,19 @@ system prompt 计算 HMAC-SHA256 签名，并流式转发响应。保留原有�
 - Hermes Agent
 - Pi（通过 CLIProxyAPI provider 插件）
 - ZCode
+- WorkBuddy / WorkBuddy AI
+- Antigravity CLI
 - Kimi Code
 - Grok Build
 
 对于受支持的客户端，软件可以同步可用模型目录、选择默认模型、在应用托管配置前备份原始配置，
 以及恢复之前的配置。
+
+WorkBuddy 接入沿用模型选择、更新配置、关闭配置修改、手动备份/恢复和桌面启动/重启流程。
+支持 WorkBuddy 与 WorkBuddy AI 的 `models.json` 对象及数组格式，并保留已有自定义模型。
+应用后需在 WorkBuddy 内选择 `CPA:模型名`；已有会话不会自动切换模型，未显示时可重启 App。
+
+Antigravity CLI 通过 CPA 的 Gemini 兼容接口连接。CLI 请从 CPA 启动，以便为该进程注入接口地址和密钥；直接运行 `agy` 时需自行设置环境变量。
 
 ## 其他功能
 

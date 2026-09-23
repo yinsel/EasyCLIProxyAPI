@@ -180,6 +180,7 @@ export function KernelPage({ view = 'home' }: { view?: KernelView }) {
   const currentVersion = coreStatus?.currentVersion ?? '';
   const coreInstalled = Boolean(coreStatus?.installed);
   const coreRunning = Boolean(coreStatus?.running);
+  const coreReady = Boolean(coreStatus?.ready);
   const coreProcessBusy = processBusy || Boolean(coreStatus?.starting);
 
   const statusTone = statusError ? 'error' : coreRunning ? 'success' : 'neutral';
@@ -311,7 +312,7 @@ export function KernelPage({ view = 'home' }: { view?: KernelView }) {
                   </button>
                   <button
                     type="button"
-                    className="icon-button quiet"
+                    className={`icon-button quiet ${copiedApiField === 'home:apikey' ? 'copied' : ''}`}
                     onClick={() => void copyApiValue(homeApiKey, 'home:apikey')}
                     title={copiedApiField === 'home:apikey' ? t('config.notice.keyCopied') : t('config.keys.copy')}
                     aria-label={copiedApiField === 'home:apikey' ? t('config.notice.keyCopied') : t('config.keys.copy')}
@@ -326,8 +327,8 @@ export function KernelPage({ view = 'home' }: { view?: KernelView }) {
               )}
             </div>
           </div>
-          <span className={`state-pill ${coreRunning ? 'success' : 'neutral'}`}>
-            {coreRunning ? t('kernel.access.connectable') : t('kernel.access.waiting')}
+          <span className={`state-pill ${coreReady ? 'success' : 'neutral'}`}>
+            {coreReady ? t('kernel.access.connectable') : t('kernel.access.waiting')}
           </span>
         </div>
 
@@ -341,17 +342,27 @@ export function KernelPage({ view = 'home' }: { view?: KernelView }) {
                 </span>
                 <div>
                   <strong>{profile.name}</strong>
-                  <span>{profile.description}</span>
+                  <span className="client-api-format-tag">{profile.description}</span>
                 </div>
               </div>
 
               <div className="client-api-values">
                 <div className="client-api-value-row">
                   <span>{t('kernel.access.apiUrl')}</span>
-                  <code title={profile.baseUrl}>{profile.baseUrl}</code>
+                  <code
+                    title={profile.baseUrl}
+                    onClick={() =>
+                      void copyApiValue(
+                        profile.baseUrl,
+                        `${profile.id}:base`,
+                      )
+                    }
+                  >
+                    {profile.baseUrl}
+                  </code>
                   <button
                     type="button"
-                    className="icon-button quiet"
+                    className={`icon-button quiet ${copiedApiField === `${profile.id}:base` ? 'copied' : ''}`}
                     onClick={() =>
                       void copyApiValue(
                         profile.baseUrl,

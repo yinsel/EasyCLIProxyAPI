@@ -74,6 +74,8 @@ fn tracked_configuration_paths(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, S
         AgentClient::Hermes,
         AgentClient::DeepSeekHarness,
         AgentClient::ZCode,
+        AgentClient::WorkBuddy,
+        AgentClient::AntigravityCli,
         AgentClient::KimiCode,
         AgentClient::GrokBuild,
     ] {
@@ -147,6 +149,7 @@ fn handle_configuration_file_changes(
                     let mut config = toml::from_str::<GuiConfigFile>(&content)
                         .map_err(|error| format!("解析 GUI 配置失败: {error}"))?;
                     config.allow_lan = !is_loopback_host(&config.host);
+                    config.proxy_url = super::network_proxy::resolve(&config);
                     validate_gui_config(&config)?;
                     Ok(config)
                 })();
@@ -193,7 +196,7 @@ fn handle_configuration_file_changes(
                     if preserve_invalid_gui_file {
                         gui_state.replace_core_settings_external(&settings)?;
                     } else {
-                        gui_state.sync_core_settings(&settings)?;
+                        gui_state.sync_core_settings_external(&settings)?;
                     }
                     cache.clear()?;
                     Ok(())

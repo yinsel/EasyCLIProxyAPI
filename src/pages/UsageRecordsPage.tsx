@@ -1,5 +1,5 @@
 import { useConfirmation } from '../components/ConfirmationDialog';
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
@@ -28,17 +28,20 @@ import { formatUsageNumber } from '../services/usageNumber';
 import {
   OTHER_TREND_MODEL_KEY,
   buildUsageTrendSeries,
+  clampTrendRatio,
   formatTrendAxisLabel,
   formatTrendRangeLabel,
+  isClientPointInsideRect,
   niceCeiling,
-  selectTrendAxisLabels,
   trendAxisTicks,
-  smoothAreaPath,
-  smoothLinePath,
+  trendPointIndexAtRatio,
+  trendTimeAxisTicks,
+  trendTimePosition,
   stackModelTokens,
   type UsageTimelinePoint,
 } from '../services/usageTrend';
 import { createRefreshScheduler } from '../services/refreshScheduler';
+import { usageViewScopeKey } from '../services/usageViewScope';
 
 type UsageTab = 'overview' | 'analysis' | 'events' | 'pricing' | 'data-management';
 type UsageRange = '4h' | '24h' | 'today' | '7d' | '30d' | 'all' | 'custom';
@@ -170,6 +173,13 @@ type UsageRepairResult = {
   backupPath: string | null;
 };
 
+type UsageStorageSettings = {
+  maxDatabaseSizeMb: number;
+  databaseSizeBytes: number;
+  totalRecords: number;
+  deletedRecords: number;
+};
+
 type ModelPriceSyncResult = {
   imported: number;
   skipped: number;
@@ -240,6 +250,13 @@ const rangeQuery = (range: UsageRange, customStart: string, customEnd: string): 
 
 const compactNumber = (value: number) => formatUsageNumber(value, getCurrentLocale());
 
+const formatStorageBytes = (value: number) => {
+  const bytes = Number.isFinite(value) ? Math.max(0, value) : 0;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+};
+
 const formatUsd = (amount: number) => {
   if (!Number.isFinite(amount) || amount <= 0) return '$0.00';
   const maximumFractionDigits =
@@ -295,9 +312,10 @@ export function UsageRecordsPage() {
   const [pricing, setPricing] = useState<UsagePricing | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [loadedScopeKey, setLoadedScopeKey] = useState('');
   const requestIdRef = useRef(0);
   const schedulerRef = useRef<ReturnType<typeof createRefreshScheduler> | null>(null);
-  if (!schedulerRef.current) schedulerRef.current = createRefreshScheduler();
+  if (!schedulerRef.current) schedulerRef.current = createRefreshScheduler(250);
 
   useEffect(() => {
     try {
@@ -328,6 +346,32 @@ export function UsageRecordsPage() {
       } satisfies UsageQuery,
     };
   }, [apiKeyHash, customEnd, customStart, model, provider, range, result, source]);
+
+  const scopeKey = useMemo(() => usageViewScopeKey({
+    tab: activeTab,
+    range,
+    customStart,
+    customEnd,
+    model,
+    provider,
+    source,
+    apiKeyHash,
+    result,
+    page,
+    pageSize,
+  }), [
+    activeTab,
+    apiKeyHash,
+    customEnd,
+    customStart,
+    model,
+    page,
+    pageSize,
+    provider,
+    range,
+    result,
+    source,
+  ]);
 
   const executeLoadData = useCallback(
     async (quiet = false) => {
@@ -391,6 +435,7 @@ export function UsageRecordsPage() {
           setStatus(nextStatus);
           setOptionsAnalysis(nextOptions);
         }
+        setLoadedScopeKey(scopeKey);
         setError('');
       } catch (requestError) {
         if (requestId === requestIdRef.current) setError(String(requestError));
@@ -398,12 +443,13 @@ export function UsageRecordsPage() {
         if (requestId === requestIdRef.current) setLoading(false);
       }
     },
-    [activeTab, buildQueries, page, pageSize, model, provider, source, apiKeyHash, result]
+    [activeTab, buildQueries, page, pageSize, model, provider, source, apiKeyHash, result, scopeKey]
   );
 
   const loadData = useCallback(
     (quiet = false, immediate = !quiet) => {
       if (!quiet) setLoading(true);
+      if (!quiet) return schedulerRef.current!.runForeground(() => executeLoadData(false));
       return schedulerRef.current!.schedule(() => executeLoadData(quiet), immediate);
     },
     [executeLoadData],
@@ -421,7 +467,10 @@ export function UsageRecordsPage() {
     let disposed = false;
     let unlisten: (() => void) | null = null;
     const refresh = () => {
-      if (!disposed && !document.hidden) void loadData(true, true);
+      // WebView2 may classify an unfocused or occluded window on another monitor
+      // as hidden. Keep usage refreshes independent of Page Visibility so both
+      // record events and the fallback poll continue to update the current view.
+      if (!disposed) void loadData(true, true);
     };
     listen('usage-records-updated', refresh)
       .then((stop) => {
@@ -429,7 +478,7 @@ export function UsageRecordsPage() {
         else unlisten = stop;
       })
       .catch(() => {});
-    const timer = window.setInterval(refresh, 5_000);
+    const timer = window.setInterval(refresh, 1_000);
     const refreshWhenVisible = () => {
       if (!document.hidden) refresh();
     };
@@ -466,12 +515,16 @@ export function UsageRecordsPage() {
   };
 
   const collectorTone = status?.state === 'error' ? 'error' : status?.state === 'collecting' ? 'success' : '';
+  const hasCurrentSnapshot = loadedScopeKey === scopeKey;
   const showInitialLoading =
-    loading &&
-    ((activeTab === 'overview' && !overview) ||
-      (activeTab === 'analysis' && !overview) ||
-      (activeTab === 'events' && !events) ||
-      (activeTab === 'pricing' && !pricing));
+    activeTab !== 'data-management' &&
+    !error &&
+    (!hasCurrentSnapshot ||
+      (loading &&
+        ((activeTab === 'overview' && !overview) ||
+          (activeTab === 'analysis' && !overview) ||
+          (activeTab === 'events' && !events) ||
+          (activeTab === 'pricing' && !pricing))));
 
   return (
     <section className="page management-page usage-records-page">
@@ -687,9 +740,9 @@ export function UsageRecordsPage() {
         </div>
       ) : null}
 
-      {activeTab === 'overview' && overview ? <OverviewView overview={overview} range={overviewRange} /> : null}
-      {activeTab === 'analysis' ? <AnalysisView analysis={analysis} overview={overview} /> : null}
-      {activeTab === 'events' && events ? (
+      {hasCurrentSnapshot && activeTab === 'overview' && overview ? <OverviewView overview={overview} range={overviewRange} /> : null}
+      {hasCurrentSnapshot && activeTab === 'analysis' ? <AnalysisView analysis={analysis} overview={overview} /> : null}
+      {hasCurrentSnapshot && activeTab === 'events' && events ? (
         <EventsView
           events={events}
           pageSize={pageSize}
@@ -700,7 +753,7 @@ export function UsageRecordsPage() {
           }}
         />
       ) : null}
-      {activeTab === 'pricing' && pricing ? (
+      {hasCurrentSnapshot && activeTab === 'pricing' && pricing ? (
         <PricingView pricing={pricing} query={buildQueries().query} onChanged={() => loadData(true)} />
       ) : null}
       {activeTab === 'data-management' ? <UsageDataManagementView /> : null}
@@ -714,6 +767,93 @@ function UsageDataManagementView() {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<UsageRepairResult | null>(null);
   const [error, setError] = useState('');
+  const [storage, setStorage] = useState<UsageStorageSettings | null>(null);
+  const [limitDraft, setLimitDraft] = useState('0');
+  const [loadingLimit, setLoadingLimit] = useState(true);
+  const [savingLimit, setSavingLimit] = useState(false);
+  const [shrinkDraft, setShrinkDraft] = useState('');
+  const [shrinking, setShrinking] = useState(false);
+  const [storageNotice, setStorageNotice] = useState('');
+
+  useEffect(() => {
+    let disposed = false;
+    invoke<UsageStorageSettings>('get_usage_storage_settings')
+      .then((next) => {
+        if (disposed) return;
+        setStorage(next);
+        setLimitDraft(String(next.maxDatabaseSizeMb));
+      })
+      .catch((requestError) => {
+        if (!disposed) setError(String(requestError));
+      })
+      .finally(() => {
+        if (!disposed) setLoadingLimit(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const saveStorageLimit = async () => {
+    const normalized = limitDraft.trim();
+    const maxDatabaseSizeMb = Number(normalized);
+    if (!/^\d+$/.test(normalized) || !Number.isSafeInteger(maxDatabaseSizeMb)) {
+      setError(t('usage.dataManagement.storageInvalid'));
+      return;
+    }
+    setSavingLimit(true);
+    setError('');
+    setStorageNotice('');
+    try {
+      const next = await invoke<UsageStorageSettings>('save_usage_storage_settings', { maxDatabaseSizeMb });
+      setStorage(next);
+      setLimitDraft(String(next.maxDatabaseSizeMb));
+      setStorageNotice(t(
+        next.deletedRecords > 0
+          ? 'usage.dataManagement.storageSavedWithCleanup'
+          : 'usage.dataManagement.storageSaved',
+        { deleted: next.deletedRecords.toLocaleString() },
+      ));
+    } catch (requestError) {
+      setError(String(requestError));
+    } finally {
+      setSavingLimit(false);
+    }
+  };
+
+  const shrinkDatabase = async () => {
+    const normalized = shrinkDraft.trim();
+    const targetDatabaseSizeMb = Number(normalized);
+    if (!/^\d+$/.test(normalized) || !Number.isSafeInteger(targetDatabaseSizeMb) || targetDatabaseSizeMb <= 0) {
+      setError(t('usage.dataManagement.shrinkInvalid'));
+      return;
+    }
+    const confirmed = await askConfirmation({
+      title: t('usage.dataManagement.shrinkConfirmTitle'),
+      message: t('usage.dataManagement.shrinkConfirm', { size: targetDatabaseSizeMb }),
+    });
+    if (!confirmed) return;
+    setShrinking(true);
+    setError('');
+    setStorageNotice('');
+    try {
+      const next = await invoke<UsageStorageSettings>('shrink_usage_database', { targetDatabaseSizeMb });
+      setStorage(next);
+      setStorageNotice(t(
+        next.deletedRecords > 0
+          ? 'usage.dataManagement.shrinkSuccess'
+          : 'usage.dataManagement.shrinkNoCleanup',
+        {
+          deleted: next.deletedRecords.toLocaleString(),
+          size: formatStorageBytes(next.databaseSizeBytes),
+        },
+      ));
+    } catch (requestError) {
+      setError(String(requestError));
+    } finally {
+      setShrinking(false);
+    }
+  };
 
   const repair = async () => {
     if (!await askConfirmation({ title: t('usage.dataManagement.title'), message: t('usage.dataManagement.confirm') })) return;
@@ -723,6 +863,8 @@ function UsageDataManagementView() {
     try {
       const next = await invoke<UsageRepairResult>('repair_usage_cache_records');
       setResult(next);
+      const nextStorage = await invoke<UsageStorageSettings>('get_usage_storage_settings');
+      setStorage(nextStorage);
     } catch (requestError) {
       setError(String(requestError));
     } finally {
@@ -736,25 +878,91 @@ function UsageDataManagementView() {
       <div className="usage-data-management-heading">
         <div>
           <Wrench size={20} aria-hidden="true" />
-          <div>
-            <h2>{t('usage.dataManagement.title')}</h2>
-            <p>{t('usage.dataManagement.description')}</p>
-          </div>
+          <h2>{t('usage.dataManagement.title')}</h2>
         </div>
         <span className="usage-data-management-badge">{t('usage.dataManagement.manualBadge')}</span>
       </div>
 
-      <div className="usage-data-management-notice">
-        <TriangleAlert size={17} aria-hidden="true" />
-        <span>{t('usage.dataManagement.notice')}</span>
+      <div className="usage-data-management-action usage-storage-limit-action">
+        <div>
+          <strong>{t('usage.dataManagement.storageTitle')}</strong>
+          <span>{t('usage.dataManagement.storageDescription')}</span>
+          {storage ? (
+            <small>
+              {t('usage.dataManagement.storageCurrent', {
+                size: formatStorageBytes(storage.databaseSizeBytes),
+                records: compactNumber(storage.totalRecords),
+              })}
+            </small>
+          ) : null}
+        </div>
+        <div className="usage-storage-limit-editor">
+          <label>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={limitDraft}
+              disabled={loadingLimit || savingLimit || shrinking || running}
+              onChange={(event) => setLimitDraft(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !loadingLimit && !savingLimit && !shrinking && !running) void saveStorageLimit();
+              }}
+              aria-label={t('usage.dataManagement.storageInput')}
+            />
+            <span>{t('usage.dataManagement.storageUnit')}</span>
+          </label>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => void saveStorageLimit()}
+            disabled={loadingLimit || savingLimit || shrinking || running}
+          >
+            {savingLimit ? t('usage.dataManagement.storageSaving') : t('usage.dataManagement.storageSave')}
+          </button>
+        </div>
       </div>
+
+      <div className="usage-data-management-action">
+        <div>
+          <strong>{t('usage.dataManagement.shrinkTitle')}</strong>
+          <span>{t('usage.dataManagement.shrinkDescription')}</span>
+        </div>
+        <div className="usage-storage-limit-editor">
+          <label>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={shrinkDraft}
+              disabled={savingLimit || shrinking || running}
+              onChange={(event) => setShrinkDraft(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !savingLimit && !shrinking && !running) void shrinkDatabase();
+              }}
+              aria-label={t('usage.dataManagement.shrinkInput')}
+            />
+            <span>{t('usage.dataManagement.storageUnit')}</span>
+          </label>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => void shrinkDatabase()}
+            disabled={savingLimit || shrinking || running}
+          >
+            {shrinking ? t('usage.dataManagement.shrinking') : t('usage.dataManagement.shrinkRun')}
+          </button>
+        </div>
+      </div>
+
+      {storageNotice ? <MessageNotice tone="success" message={storageNotice} onDismiss={() => setStorageNotice('')} /> : null}
 
       <div className="usage-data-management-action">
         <div>
           <strong>{t('usage.dataManagement.actionTitle')}</strong>
           <span>{t('usage.dataManagement.actionDescription')}</span>
         </div>
-        <button type="button" className="primary-button" onClick={() => void repair()} disabled={running}>
+        <button type="button" className="primary-button" onClick={() => void repair()} disabled={running || savingLimit || shrinking}>
           {running ? t('usage.dataManagement.running') : t('usage.dataManagement.run')}
         </button>
       </div>
@@ -794,6 +1002,21 @@ function OverviewView({ overview, range }: { overview: UsageOverview; range?: Pi
       }),
     },
     {
+      label: t('usage.stat.tps'),
+      value: overview.tpsSampleCount > 0 ? overview.tps.toFixed(1) : '—',
+      meta: t('usage.stat.performanceMeta', {
+        samples: compactNumber(overview.tpsSampleCount),
+        rpm: overview.rpm.toFixed(2),
+        latency: Math.round(overview.averageLatencyMs),
+      }),
+      metaTitle: t('usage.stat.performanceMetaTitle', {
+        tps: overview.tpsSampleCount > 0 ? overview.tps.toFixed(1) : '—',
+        samples: compactNumber(overview.tpsSampleCount),
+        rpm: overview.rpm.toFixed(2),
+        latency: Math.round(overview.averageLatencyMs),
+      }),
+    },
+    {
       label: t('usage.stat.tokens'),
       value: compactNumber(overview.totalTokens),
       meta: t('usage.stat.tokenMeta', {
@@ -818,21 +1041,6 @@ function OverviewView({ overview, range }: { overview: UsageOverview; range?: Pi
         success: compactNumber(overview.successCount),
         failed: compactNumber(overview.failureCount),
         canceled: compactNumber(overview.canceledCount),
-      }),
-    },
-    {
-      label: t('usage.stat.tps'),
-      value: overview.tpsSampleCount > 0 ? `${overview.tps.toFixed(1)} TPS` : '—',
-      meta: t('usage.stat.performanceMeta', {
-        samples: compactNumber(overview.tpsSampleCount),
-        rpm: overview.rpm.toFixed(2),
-        latency: Math.round(overview.averageLatencyMs),
-      }),
-      metaTitle: t('usage.stat.performanceMetaTitle', {
-        tps: overview.tpsSampleCount > 0 ? overview.tps.toFixed(1) : '—',
-        samples: compactNumber(overview.tpsSampleCount),
-        rpm: overview.rpm.toFixed(2),
-        latency: Math.round(overview.averageLatencyMs),
       }),
     },
     {
@@ -867,12 +1075,9 @@ function OverviewView({ overview, range }: { overview: UsageOverview; range?: Pi
     <div className="usage-overview-layout">
       <div className="usage-stat-grid">
         {cards.map(({ label, value, meta, metaTitle }) => (
-          <article className="panel usage-stat-card" key={label}>
+          <article className="panel usage-stat-card" key={label} title={metaTitle ?? meta}>
             <span className="usage-stat-card-label">{label}</span>
             <strong className="usage-stat-card-value">{value}</strong>
-            <small className="usage-stat-card-meta" title={metaTitle ?? meta}>
-              {meta}
-            </small>
           </article>
         ))}
       </div>
@@ -882,7 +1087,7 @@ function OverviewView({ overview, range }: { overview: UsageOverview; range?: Pi
             <strong>{t('usage.trend.title')}</strong>
           </div>
         </div>
-        {overview.timeline.length ? <UsageTrend points={overview.timeline} range={range} /> : <UsageEmpty />}
+        <UsageTrend points={overview.timeline} range={range} />
       </section>
       <section className="panel usage-health-panel">
         <div className="usage-section-heading">
@@ -936,8 +1141,10 @@ function UsageTrend({
   range?: Pick<UsageQuery, 'start' | 'end'>;
 }) {
   const { t, locale } = useI18n();
-  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const [hoveredRatio, setHoveredRatio] = useState<number | null>(null);
   const [hiddenModels, setHiddenModels] = useState<string[]>([]);
+  const plotRef = useRef<HTMLDivElement>(null);
+  const [plotWidth, setPlotWidth] = useState(0);
 
   const series = useMemo(
     () => buildUsageTrendSeries(points, range),
@@ -945,36 +1152,63 @@ function UsageTrend({
   );
 
   const hiddenKeys = useMemo(() => new Set(hiddenModels), [hiddenModels]);
-  const visibleModels = useMemo(
-    () => series.models.filter((model) => !hiddenKeys.has(model.key)),
-    [hiddenKeys, series.models],
-  );
-
   useEffect(() => {
-    setHoveredIndex(null);
-    setHiddenModels((current) => current.filter((key) => series.models.some((model) => model.key === key)));
-  }, [series.bucket, series.models, series.points[0]?.hour, series.points[series.points.length - 1]?.hour]);
+    const available = new Set(series.models.map((model) => model.key));
+    setHiddenModels((current) => {
+      const next = current.filter((key) => available.has(key));
+      return next.length === current.length && next.every((key, index) => key === current[index])
+        ? current
+        : next;
+    });
+  }, [series.models]);
 
   const count = series.points.length;
 
-  const chart = useMemo(() => {
-    if (count === 0) {
-      return {
-        maxTokens: 1,
-        stacked: [],
-        areaLayers: [],
-        totalLinePath: '',
-        yTicks: [0, 0.25, 0.5, 0.75, 1],
-        labelIndexes: [],
-        compactSameDay: false,
-        baseY: 146,
-        PT: 8,
-        UH: 138,
-      };
-    }
+  useLayoutEffect(() => {
+    const plot = plotRef.current;
+    if (!plot) return;
+    let frame = 0;
+    const updateWidth = (width: number) => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const next = Math.max(0, Math.round(width));
+        setPlotWidth((current) => current === next ? current : next);
+      });
+    };
+    const measure = () => updateWidth(plot.getBoundingClientRect().width);
+    measure();
+    const observer = typeof ResizeObserver === 'undefined'
+      ? null
+      : new ResizeObserver(([entry]) => updateWidth(entry.contentRect.width));
+    observer?.observe(plot);
+    window.addEventListener('resize', measure);
+    return () => {
+      cancelAnimationFrame(frame);
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [count > 0]);
 
+  useEffect(() => {
+    if (count === 0) setHoveredRatio(null);
+  }, [count === 0]);
+
+  useEffect(() => {
+    if (hoveredRatio == null) return undefined;
+    const onWindowPointerMove = (event: PointerEvent) => {
+      if (event.clientX === 0 && event.clientY === 0) return;
+      const plot = plotRef.current;
+      if (!plot || !isClientPointInsideRect(event.clientX, event.clientY, plot.getBoundingClientRect())) {
+        setHoveredRatio(null);
+      }
+    };
+    window.addEventListener('pointermove', onWindowPointerMove);
+    return () => window.removeEventListener('pointermove', onWindowPointerMove);
+  }, [hoveredRatio == null]);
+
+  const chart = useMemo(() => {
     const stacked = series.points.map((point) => stackModelTokens(point, series.models, hiddenKeys));
-    const maxTokens = niceCeiling(Math.max(1, ...stacked.map((layers) => layers[layers.length - 1]?.y1 ?? 0)));
+    const maxTokens = niceCeiling(stacked.reduce((max, layers) => Math.max(max, layers[layers.length - 1]?.y1 ?? 0), 1));
 
     const VIEWBOX_W = 1000;
     const PT = 8;
@@ -983,74 +1217,44 @@ function UsageTrend({
     const baseY = PT + UH;
 
     const calcY = (val: number) => (maxTokens > 0 ? baseY - (val / maxTokens) * UH : baseY);
-    const calcX = (idx: number) => (count <= 1 ? VIEWBOX_W / 2 : (idx / (count - 1)) * VIEWBOX_W);
-
-    const areaLayers = visibleModels.map((model) => {
-      let topPoints: { x: number; y: number }[];
-      let bottomPoints: { x: number; y: number }[];
-
-      if (count <= 1) {
-        const y1 = calcY(stacked[0]?.find((l) => l.key === model.key)?.y1 ?? 0);
-        const y0 = calcY(stacked[0]?.find((l) => l.key === model.key)?.y0 ?? 0);
-        topPoints = [{ x: 0, y: y1 }, { x: VIEWBOX_W, y: y1 }];
-        bottomPoints = [{ x: 0, y: y0 }, { x: VIEWBOX_W, y: y0 }];
-      } else {
-        topPoints = series.points.map((_, idx) => ({
-          x: calcX(idx),
-          y: calcY(stacked[idx]?.find((l) => l.key === model.key)?.y1 ?? 0),
-        }));
-        bottomPoints = series.points.map((_, idx) => ({
-          x: calcX(idx),
-          y: calcY(stacked[idx]?.find((l) => l.key === model.key)?.y0 ?? 0),
-        }));
-      }
-
-      const areaPath = smoothAreaPath(topPoints, bottomPoints);
-      const linePath = smoothLinePath(topPoints);
-      const hasTokens = stacked.some((layers) => (layers.find((l) => l.key === model.key)?.tokens ?? 0) > 0);
-
+    const start = series.points[0]?.start ?? new Date(0);
+    const end = series.points[count - 1]?.end ?? start;
+    const bars = series.points.map((point, index) => {
+      const left = trendTimePosition(point.start, start, end) * VIEWBOX_W;
+      const right = trendTimePosition(point.end, start, end) * VIEWBOX_W;
+      const gap = Math.min((right - left) * 0.2, 6);
       return {
-        model,
-        areaPath,
-        linePath,
-        hasTokens,
+        x: left + gap / 2,
+        width: right - left - gap,
+        center: (left + right) / 2,
+        layers: stacked[index].filter((layer) => layer.tokens > 0).map((layer) => ({
+          ...layer,
+          y: calcY(layer.y1),
+          height: (layer.tokens / maxTokens) * UH,
+          color: series.models.find((model) => model.key === layer.key)?.color,
+        })),
       };
     });
-
-    let totalPoints: { x: number; y: number }[];
-    if (count <= 1) {
-      const topY = calcY(stacked[0]?.[stacked[0]?.length - 1]?.y1 ?? 0);
-      totalPoints = [{ x: 0, y: topY }, { x: VIEWBOX_W, y: topY }];
-    } else {
-      totalPoints = series.points.map((_, idx) => ({
-        x: calcX(idx),
-        y: calcY(stacked[idx]?.[stacked[idx]?.length - 1]?.y1 ?? 0),
-      }));
-    }
-    const totalLinePath = smoothLinePath(totalPoints);
     const yTicks = trendAxisTicks(maxTokens);
-
-    const labelIndexes = selectTrendAxisLabels(
-      count,
-      count > 48 ? 5 : count > 24 ? 6 : 7,
-    );
-    const compactSameDay =
-      count > 1 &&
-      series.points[0].start.toDateString() === series.points[count - 1].start.toDateString();
+    const compactSameDay = start.toDateString() === end.toDateString();
+    const timeTicks = trendTimeAxisTicks(start, end, plotWidth, compactSameDay ? 64 : 112);
+    const showAxisTime = timeTicks.length > 1 && timeTicks[1].getTime() - timeTicks[0].getTime() < 24 * 60 * 60 * 1000;
 
     return {
       maxTokens,
       stacked,
-      areaLayers,
-      totalLinePath,
+      bars,
+      start,
+      end,
       yTicks,
-      labelIndexes,
+      timeTicks,
       compactSameDay,
+      showAxisTime,
       baseY,
       PT,
       UH,
     };
-  }, [count, hiddenKeys, series, visibleModels]);
+  }, [count, hiddenKeys, series, plotWidth]);
 
   if (count === 0) {
     return <UsageEmpty />;
@@ -1059,43 +1263,54 @@ function UsageTrend({
   const modelLabel = (key: string, fallback: string) =>
     key === OTHER_TREND_MODEL_KEY ? t('usage.trend.other') : fallback;
 
-  const bucketLabel = t(`usage.trend.bucket.${series.bucket}` as MessageKey);
+  const hoveredIndex = hoveredRatio == null
+    ? -1
+    : trendPointIndexAtRatio(series.points, chart.start, chart.end, hoveredRatio);
 
   const handlePointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     if (rect.width <= 0 || count === 0) return;
-    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const idx = Math.round(ratio * (count - 1));
-    setHoveredIndex(idx);
+    setHoveredRatio(clampTrendRatio((e.clientX - rect.left) / rect.width));
   };
 
-  const handlePointerLeave = () => {
-    setHoveredIndex(null);
+  const handlePointerLeave = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const next = e.relatedTarget;
+    if (next instanceof Node && e.currentTarget.contains(next)) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (isClientPointInsideRect(e.clientX, e.clientY, rect)) return;
+    if (e.clientX === 0 && e.clientY === 0) return;
+    setHoveredRatio(null);
   };
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (count === 0) return;
     if (e.key === 'ArrowLeft') {
       e.preventDefault();
-      setHoveredIndex((prev) => (prev == null || prev <= 0 ? count - 1 : prev - 1));
+      const current = hoveredIndex < 0
+        ? count - 1
+        : (hoveredIndex <= 0 ? count - 1 : hoveredIndex - 1);
+      setHoveredRatio((chart.bars[current]?.center ?? 0) / 1000);
     } else if (e.key === 'ArrowRight') {
       e.preventDefault();
-      setHoveredIndex((prev) => (prev == null || prev >= count - 1 ? 0 : prev + 1));
+      const current = hoveredIndex < 0
+        ? 0
+        : (hoveredIndex >= count - 1 ? 0 : hoveredIndex + 1);
+      setHoveredRatio((chart.bars[current]?.center ?? 0) / 1000);
     } else if (e.key === 'Home') {
       e.preventDefault();
-      setHoveredIndex(0);
+      setHoveredRatio((chart.bars[0]?.center ?? 0) / 1000);
     } else if (e.key === 'End') {
       e.preventDefault();
-      setHoveredIndex(count - 1);
+      setHoveredRatio((chart.bars[count - 1]?.center ?? 0) / 1000);
     } else if (e.key === 'Escape') {
-      setHoveredIndex(null);
+      setHoveredRatio(null);
     }
   };
 
-  const active = hoveredIndex != null && hoveredIndex >= 0 && hoveredIndex < count ? series.points[hoveredIndex] : null;
-  const activeStacked = hoveredIndex != null && chart.stacked[hoveredIndex] ? chart.stacked[hoveredIndex] : [];
-  const activePercent = count <= 1 ? 50 : ((hoveredIndex ?? 0) / (count - 1)) * 100;
-  const activeViewboxX = count <= 1 ? 500 : ((hoveredIndex ?? 0) / (count - 1)) * 1000;
+  const active = hoveredIndex >= 0 && hoveredIndex < count ? series.points[hoveredIndex] : null;
+  const activeStacked = hoveredIndex >= 0 && chart.stacked[hoveredIndex] ? chart.stacked[hoveredIndex] : [];
+  const activeViewboxX = hoveredIndex >= 0 ? (chart.bars[hoveredIndex]?.center ?? 0) : 0;
+  const activePercent = activeViewboxX / 10;
   const activeLayers = [...activeStacked]
     .filter((l) => l.tokens > 0)
     .sort((a, b) => b.tokens - a.tokens);
@@ -1131,28 +1346,26 @@ function UsageTrend({
             );
           })}
         </div>
-        <div className="usage-trend-header-meta">
-          <span className="usage-trend-chip">
-            <strong>{compactNumber(series.totals.tokens)}</strong> {t('usage.unit.tokens')}
-          </span>
-          <span className="usage-trend-chip">{bucketLabel}</span>
-        </div>
       </div>
 
       <div className="usage-trend-chart">
         <div className="usage-trend-y-axis" aria-hidden="true">
-          {[...chart.yTicks].reverse().map((tick, index) => (
-            <span key={`y-${tick}-${index}`}>{compactNumber(tick)}</span>
+          {chart.yTicks.map((tick) => (
+            <span key={tick} style={{ top: `${((chart.baseY - (tick / chart.maxTokens) * chart.UH) / 154) * 100}%` }}>
+              {compactNumber(tick)}
+            </span>
           ))}
         </div>
 
         <div
+          ref={plotRef}
           className="usage-trend-plot"
           tabIndex={0}
           role="region"
           aria-label={t('usage.trend.aria')}
           onPointerMove={handlePointerMove}
           onPointerLeave={handlePointerLeave}
+          onPointerCancel={handlePointerLeave}
           onKeyDown={handleKeyDown}
         >
           <svg
@@ -1160,30 +1373,6 @@ function UsageTrend({
             preserveAspectRatio="none"
             className="usage-trend-svg"
           >
-            <defs>
-              {visibleModels.map((model) => (
-                <linearGradient
-                  key={`grad-${model.key}`}
-                  id={`trend-grad-${model.key.replace(/[^a-zA-Z0-9_-]+/g, '-')}`}
-                  x1="0"
-                  y1="0"
-                  x2="0"
-                  y2="1"
-                >
-                  <stop
-                    offset="0%"
-                    stopColor={model.color}
-                    stopOpacity={0.28}
-                  />
-                  <stop
-                    offset="100%"
-                    stopColor={model.color}
-                    stopOpacity={0.08}
-                  />
-                </linearGradient>
-              ))}
-            </defs>
-
             {chart.yTicks.map((tick) => {
               const y = chart.baseY - (tick / chart.maxTokens) * chart.UH;
               const isBase = tick === 0;
@@ -1199,43 +1388,22 @@ function UsageTrend({
               );
             })}
 
-            {chart.areaLayers.map((layer) => {
-              if (!layer.hasTokens || !layer.areaPath) return null;
-              return (
-                <g key={layer.model.key} className="usage-trend-layer">
-                  <path
-                    d={layer.areaPath}
-                    fill={`url(#trend-grad-${layer.model.key.replace(/[^a-zA-Z0-9_-]+/g, '-')})`}
-                    className="usage-trend-area"
+            {chart.bars.map((bar, index) => (
+              <g key={series.points[index].hour} className={`usage-trend-bar${active && index === hoveredIndex ? ' is-active' : ''}`}>
+                {bar.layers.map((layer) => (
+                  <rect
+                    key={layer.key}
+                    x={bar.x}
+                    y={layer.y}
+                    width={bar.width}
+                    height={layer.height}
+                    fill={layer.color}
                   />
-                  <path
-                    d={layer.linePath}
-                    fill="none"
-                    stroke={layer.model.color}
-                    strokeWidth={1.4}
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    vectorEffect="non-scaling-stroke"
-                    className="usage-trend-line"
-                  />
-                </g>
-              );
-            })}
+                ))}
+              </g>
+            ))}
 
-            {chart.totalLinePath ? (
-              <path
-                d={chart.totalLinePath}
-                fill="none"
-                stroke="var(--theme-3f6f98)"
-                strokeWidth="1.2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                vectorEffect="non-scaling-stroke"
-                className="usage-trend-total-line"
-              />
-            ) : null}
-
-            {active && hoveredIndex != null ? (
+            {active ? (
               <g className="usage-trend-active-mark">
                 <line
                   x1={activeViewboxX}
@@ -1244,28 +1412,11 @@ function UsageTrend({
                   y2={chart.baseY}
                   className="usage-trend-cursor-line"
                 />
-                {activeLayers.map((layer) => {
-                  const model = series.models.find((m) => m.key === layer.key);
-                  const dotY = chart.baseY - (layer.y1 / chart.maxTokens) * chart.UH;
-                  return (
-                    <circle
-                      key={layer.key}
-                      cx={activeViewboxX}
-                      cy={dotY}
-                      r="3.5"
-                      fill="var(--theme-fffdf8)"
-                      stroke={model?.color ?? '#3b82f6'}
-                      strokeWidth="2"
-                      vectorEffect="non-scaling-stroke"
-                      className="usage-trend-dot"
-                    />
-                  );
-                })}
               </g>
             ) : null}
           </svg>
 
-          {active && hoveredIndex != null ? (
+          {active ? (
             <div
               className={`usage-trend-tooltip${activePercent > 62 ? ' is-left' : ' is-right'}`}
               style={{ left: `${activePercent}%` }}
@@ -1299,18 +1450,20 @@ function UsageTrend({
         </div>
 
         <div className="usage-trend-x-axis" aria-hidden="true">
-          {chart.labelIndexes.map((idx) => {
-            const point = series.points[idx];
-            if (!point) return null;
-            const left = count <= 1 ? 50 : (idx / (count - 1)) * 100;
-            const posClass = idx === 0 ? 'is-start' : idx === count - 1 ? 'is-end' : 'is-mid';
+          {chart.timeTicks.map((date, index) => {
+            const left = trendTimePosition(date, chart.start, chart.end) * 100;
+            const posClass = index === 0 ? 'is-start' : index === chart.timeTicks.length - 1 ? 'is-end' : 'is-mid';
             return (
               <span
-                key={`axis-${point.hour}-${idx}`}
+                key={date.getTime()}
                 className={posClass}
                 style={{ left: `${left}%` }}
+                title={date.toLocaleString(locale)}
               >
-                {formatTrendAxisLabel(point, series.bucket, locale, { compactSameDay: chart.compactSameDay })}
+                {formatTrendAxisLabel({ start: date }, series.bucket, locale, {
+                  compactSameDay: chart.compactSameDay,
+                  showTime: chart.showAxisTime,
+                })}
               </span>
             );
           })}
@@ -1542,93 +1695,79 @@ const getInitialColumnWidths = (): Record<EventColumnKey, number> => {
 
 function TableTopScrollbar({
   tableWrapRef,
-  totalWidth,
-  visibleColumnKeys,
 }: {
   tableWrapRef: React.RefObject<HTMLDivElement | null>;
-  totalWidth: number;
-  visibleColumnKeys: EventColumnKey[];
 }) {
   const scrollbarRef = useRef<HTMLDivElement | null>(null);
-  const [hasOverflow, setHasOverflow] = useState(false);
-  const [scrollWidth, setScrollWidth] = useState(totalWidth);
+  const trackRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const scrollbar = scrollbarRef.current;
+    const track = trackRef.current;
     const tableWrap = tableWrapRef.current;
-    if (!scrollbar || !tableWrap) return;
+    if (!scrollbar || !track || !tableWrap) return;
 
-    let syncing = false;
+    // Remember the positions we applied, rather than locking a whole frame.
+    // This ignores delayed programmatic/vertical scroll events without dropping
+    // newer drag or trackpad input on either surface.
+    let lastScrollbarLeft = scrollbar.scrollLeft;
+    let lastTableLeft = tableWrap.scrollLeft;
 
     const syncTable = () => {
-      if (syncing) return;
-      syncing = true;
-      tableWrap.scrollLeft = scrollbar.scrollLeft;
-      window.requestAnimationFrame(() => {
-        syncing = false;
-      });
+      const left = scrollbar.scrollLeft;
+      if (left === lastScrollbarLeft) return;
+      lastScrollbarLeft = left;
+      tableWrap.scrollLeft = left;
+      lastTableLeft = tableWrap.scrollLeft;
     };
 
     const syncScrollbar = () => {
-      if (syncing) return;
-      syncing = true;
-      scrollbar.scrollLeft = tableWrap.scrollLeft;
-      window.requestAnimationFrame(() => {
-        syncing = false;
-      });
+      const left = tableWrap.scrollLeft;
+      if (left === lastTableLeft) return;
+      lastTableLeft = left;
+      scrollbar.scrollLeft = left;
+      lastScrollbarLeft = scrollbar.scrollLeft;
     };
 
     const updateLayout = () => {
       const clientWidth = tableWrap.clientWidth;
-      const wrapScrollWidth = tableWrap.scrollWidth;
-      const maxScroll = Math.max(0, wrapScrollWidth - clientWidth);
-      const isOverflowing = maxScroll > 1;
+      const maxScroll = Math.max(0, tableWrap.scrollWidth - clientWidth);
+      const left = Math.min(tableWrap.scrollLeft, maxScroll);
 
-      setHasOverflow(isOverflowing);
-
-      if (isOverflowing) {
-        const scrollbarClientWidth = scrollbar.clientWidth || clientWidth;
-        const targetInnerWidth = scrollbarClientWidth + maxScroll;
-        setScrollWidth(targetInnerWidth);
-
-        if (tableWrap.scrollLeft > maxScroll) {
-          tableWrap.scrollLeft = maxScroll;
-        }
-        scrollbar.scrollLeft = tableWrap.scrollLeft;
-      } else {
-        tableWrap.scrollLeft = 0;
-        scrollbar.scrollLeft = 0;
-        setScrollWidth(clientWidth);
-      }
+      // Commit the range before the position. A deferred React width update can
+      // clamp the thumb to its old range and then rewind the table via scroll.
+      scrollbar.classList.toggle('is-hidden', maxScroll <= 1);
+      track.style.width = `${(scrollbar.clientWidth || clientWidth) + maxScroll}px`;
+      tableWrap.scrollLeft = left;
+      scrollbar.scrollLeft = left;
+      lastTableLeft = tableWrap.scrollLeft;
+      lastScrollbarLeft = scrollbar.scrollLeft;
     };
 
     updateLayout();
-    const frameId = window.requestAnimationFrame(updateLayout);
-
     scrollbar.addEventListener('scroll', syncTable, { passive: true });
     tableWrap.addEventListener('scroll', syncScrollbar, { passive: true });
 
-    const resizeObserver = new ResizeObserver(() => {
-      updateLayout();
-    });
+    const resizeObserver = new ResizeObserver(updateLayout);
     resizeObserver.observe(tableWrap);
     resizeObserver.observe(scrollbar);
+    // Column resizing changes the table's width without resizing its viewport.
+    if (tableWrap.firstElementChild) resizeObserver.observe(tableWrap.firstElementChild);
 
     return () => {
-      window.cancelAnimationFrame(frameId);
       scrollbar.removeEventListener('scroll', syncTable);
       tableWrap.removeEventListener('scroll', syncScrollbar);
       resizeObserver.disconnect();
     };
-  }, [tableWrapRef, totalWidth, visibleColumnKeys]);
+  }, [tableWrapRef]);
 
   return (
     <div
       ref={scrollbarRef}
-      className={`usage-table-top-scrollbar ${hasOverflow ? '' : 'is-hidden'}`}
+      className="usage-table-top-scrollbar"
       aria-hidden="true"
     >
-      <div style={{ width: `${scrollWidth}px`, height: '1px' }} />
+      <div ref={trackRef} style={{ height: '1px' }} />
     </div>
   );
 }
@@ -1978,8 +2117,6 @@ function EventsView({
       {events.items.length > 0 ? (
         <TableTopScrollbar
           tableWrapRef={tableWrapRef}
-          totalWidth={totalTableWidth}
-          visibleColumnKeys={visibleColumnKeys}
         />
       ) : null}
 

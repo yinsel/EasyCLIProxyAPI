@@ -116,6 +116,7 @@ fn claude_mapping_legacy_json_defaults_1m_preferences_off() {
 #[test]
 fn claude_code_role_mappings_drive_settings() {
     let mappings = ClaudeDesktopModelMappings {
+        desktop_models: None,
         opus: "gpt-opus".to_string(),
         sonnet: "gpt-sonnet".to_string(),
         haiku: "gpt-haiku".to_string(),
@@ -184,6 +185,7 @@ fn claude_code_role_mappings_drive_settings() {
 #[test]
 fn claude_code_runtime_settings_keep_per_role_1m_suffixes() {
     let mappings = ClaudeDesktopModelMappings {
+        desktop_models: None,
         opus: "custom-pro".to_string(),
         sonnet: "custom-pro".to_string(),
         haiku: "custom-flash".to_string(),
@@ -261,7 +263,7 @@ fn claude_code_runtime_settings_keep_per_role_1m_suffixes() {
 }
 
 #[test]
-fn claude_desktop_keeps_original_context_when_1m_is_off() {
+fn claude_desktop_omits_unsupported_context_window_when_1m_is_off() {
     let models = vec![AgentModelOption {
         input_modalities: None,
         harness_metadata: None,
@@ -277,7 +279,7 @@ fn claude_desktop_keeps_original_context_when_1m_is_off() {
         &models,
     );
 
-    assert_eq!(entry["contextWindow"], 1_000_000);
+    assert!(entry.get("contextWindow").is_none());
     assert!(entry.get("supports1m").is_none());
     assert!(entry.get("prefer1m").is_none());
 }
@@ -553,15 +555,20 @@ fn claude_desktop_config_builds_gateway_profile_and_index() {
     let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
 
     assert_eq!(profile["keep"], true);
-    assert!(profile.get("coworkEgressAllowedHosts").is_none());
+    assert_eq!(
+        profile["coworkEgressAllowedHosts"],
+        serde_json::json!(["*"])
+    );
     assert_eq!(profile["inferenceGatewayApiKey"], DEFAULT_API_KEY);
     assert_eq!(profile["inferenceGatewayBaseUrl"], "http://127.0.0.1:8317");
     assert_eq!(
         profile["inferenceModels"],
         serde_json::json!([
-            { "name": CLAUDE_DESKTOP_OPUS_MODEL_ID },
-            { "name": CLAUDE_DESKTOP_SONNET_MODEL_ID },
-            { "name": CLAUDE_DESKTOP_HAIKU_MODEL_ID }
+            {
+                "name": "claude-sonnet-test",
+                "anthropicFamilyTier": "opus",
+                "isFamilyDefault": true
+            }
         ])
     );
     assert_eq!(meta["appliedId"], CLAUDE_DESKTOP_PROFILE_ID);
@@ -628,20 +635,29 @@ fn claude_desktop_profile_keeps_non_claude_models_internal() {
         serde_json::json!([
             {
                 "name": CLAUDE_DESKTOP_OPUS_MODEL_ID,
-                "contextWindow": 1000000,
+                "labelOverride": "gpt-5.6-sol",
+                "anthropicFamilyTier": "opus",
+                "isFamilyDefault": true,
                 "supports1m": true,
                 "prefer1m": true
             },
-            { "name": CLAUDE_DESKTOP_SONNET_MODEL_ID, "contextWindow": 272000 },
+            {
+                "name": CLAUDE_DESKTOP_SONNET_MODEL_ID,
+                "labelOverride": "gpt-5.6",
+                "anthropicFamilyTier": "sonnet",
+                "isFamilyDefault": true
+            },
             {
                 "name": CLAUDE_DESKTOP_HAIKU_MODEL_ID,
-                "contextWindow": 1000000,
+                "labelOverride": "gpt-5.6-mini",
+                "anthropicFamilyTier": "haiku",
+                "isFamilyDefault": true,
                 "supports1m": true,
                 "prefer1m": true
             }
         ])
     );
-    assert!(!profile.to_string().contains("gpt-"));
+    assert_eq!(profile["inferenceModels"][0]["labelOverride"], "gpt-5.6-sol");
 }
 
 #[cfg(target_os = "windows")]
@@ -1648,7 +1664,7 @@ fn deepseek_harness_removal_preserves_other_versioned_credentials() {
     )
     .unwrap();
 
-    let changed = remove_deepseek_harness_managed_configuration(&paths).unwrap();
+    let changed = remove_agent_managed_configuration(AgentClient::DeepSeekHarness, &paths).unwrap();
     let value: serde_norway::Value =
         serde_norway::from_str(&fs::read_to_string(&paths[1]).unwrap()).unwrap();
 
@@ -1677,7 +1693,7 @@ fn deepseek_harness_removal_deletes_semantically_empty_credentials_file() {
     )
     .unwrap();
 
-    let changed = remove_deepseek_harness_managed_configuration(&paths).unwrap();
+    let changed = remove_agent_managed_configuration(AgentClient::DeepSeekHarness, &paths).unwrap();
 
     assert_eq!(changed, vec![path_to_string(&paths[1])]);
     assert!(!paths[1].exists());
@@ -1794,7 +1810,7 @@ fn claude_desktop_aliases_expose_role_routes_only() {
     );
     assert!(!rendered.contains("models: [{"));
     assert!(rendered.contains("\n      - name: gpt-5.6-sol\n"));
-    assert!(rendered.contains("\n        alias: claude-opus-5\n"));
+    assert!(rendered.contains(&format!("\n        alias: {CLAUDE_DESKTOP_OPUS_MODEL_ID}\n")));
     assert!(
         rendered.contains("\n        display-name: EasyCLIProxyAPI managed Claude Opus mapping\n")
     );
@@ -1891,22 +1907,7 @@ fn claude_desktop_aliases_support_claude_oauth_models() {
     .unwrap();
     let value: serde_norway::Value = serde_norway::from_str(&rendered).unwrap();
     let root = value.as_mapping().unwrap();
-    let aliases = yaml_mapping_value(root, "oauth-model-alias")
-        .and_then(serde_norway::Value::as_mapping)
-        .and_then(|channels| yaml_mapping_value(channels, "claude"))
-        .and_then(serde_norway::Value::as_sequence)
-        .unwrap();
-
-    assert_eq!(aliases.len(), 3);
-    assert!(aliases.iter().all(|entry| {
-        configured_model_identity(entry).is_some_and(|(source, _, _)| source == "claude-sonnet-4-6")
-    }));
-    assert!(aliases.iter().all(|entry| {
-        entry
-            .as_mapping()
-            .and_then(|entry| yaml_mapping_value(entry, "fork"))
-            == Some(&serde_norway::Value::Bool(true))
-    }));
+    assert!(yaml_mapping_value(root, "oauth-model-alias").is_none());
     assert_eq!(
         ensure_claude_desktop_model_aliases_with_oauth_definitions_in_yaml(
             &rendered,
@@ -2148,7 +2149,8 @@ fn claude_desktop_uses_selected_alias_directly_with_original_context() {
         profile["inferenceModels"],
         serde_json::json!([{
             "name": "gpt-high",
-            "contextWindow": 1_000_000,
+            "anthropicFamilyTier": "sonnet",
+            "isFamilyDefault": true,
             "supports1m": true,
             "prefer1m": true
         }])

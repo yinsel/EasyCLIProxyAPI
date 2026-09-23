@@ -17,7 +17,7 @@ const path = require('node:path');
       await page.goto('http://localhost:1421/tests/fixtures/agent-backups.html?reset-selections&' + query);
       await page.waitForFunction(() => {
         const refresh = document.querySelector('.agent-header-actions button');
-        return refresh && !refresh.disabled && document.querySelector('.agent-model-trigger')
+        return refresh && !refresh.disabled && document.querySelector('.agent-model-trigger, .agent-desktop-models')
           && window.fixtureCalls.some(call => call.cmd === 'get_agent_models');
       });
     };
@@ -25,6 +25,70 @@ const path = require('node:path');
     const button = name => page.getByRole('button', { name, exact: true });
     const calls = cmd => page.evaluate(cmd => window.fixtureCalls.filter(call => call.cmd === cmd), cmd);
     const pending = () => page.getByText('待应用', { exact: true }).waitFor();
+    const assertPanelContentFullyVisible = async context => {
+      const layout = await page.locator('.agent-config-panel').evaluate(panel => {
+        const tolerance = 1.5;
+        const panelRect = panel.getBoundingClientRect();
+        const panelStyle = getComputedStyle(panel);
+        const isVisible = element => {
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden'
+            && rect.width > 0 && rect.height > 0;
+        };
+        const describe = element => {
+          const id = element.id ? `#${element.id}` : '';
+          const classes = [...element.classList].slice(0, 3).map(name => `.${name}`).join('');
+          const role = element.getAttribute('role');
+          const text = (element.getAttribute('aria-label') || element.textContent || '')
+            .replace(/\s+/g, ' ').trim().slice(0, 80);
+          return `${element.tagName.toLowerCase()}${id}${classes}${role ? `[role="${role}"]` : ''}${text ? ` "${text}"` : ''}`;
+        };
+        const outsidePanel = [];
+        const internallyClipped = [];
+        const activePanel = panel.querySelector('[role="tabpanel"]');
+        const candidates = new Set([
+          ...panel.querySelectorAll(':scope > *'),
+          ...(activePanel ? activePanel.querySelectorAll(':scope > *') : []),
+          ...panel.querySelectorAll('button, input, select, textarea, [role="tab"], [role="radio"], [role="switch"], [role="combobox"]'),
+        ]);
+
+        for (const element of candidates) {
+          if (!isVisible(element)) continue;
+          const rect = element.getBoundingClientRect();
+          if (rect.left < panelRect.left - tolerance || rect.right > panelRect.right + tolerance
+            || rect.top < panelRect.top - tolerance || rect.bottom > panelRect.bottom + tolerance) {
+            outsidePanel.push({
+              element: describe(element),
+              rect: { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
+            });
+          }
+          if (element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1) {
+            internallyClipped.push({
+              element: describe(element),
+              client: { width: element.clientWidth, height: element.clientHeight },
+              scroll: { width: element.scrollWidth, height: element.scrollHeight },
+            });
+          }
+        }
+
+        return {
+          client: { width: panel.clientWidth, height: panel.clientHeight },
+          scroll: { width: panel.scrollWidth, height: panel.scrollHeight },
+          overflowX: panelStyle.overflowX,
+          overflowY: panelStyle.overflowY,
+          outsidePanel,
+          internallyClipped,
+        };
+      });
+      const clippedOverflowValues = new Set(['auto', 'scroll', 'hidden', 'clip']);
+      assert.ok(!clippedOverflowValues.has(layout.overflowX), `${context}: outer panel must not clip or scroll horizontally (${JSON.stringify(layout)})`);
+      assert.ok(!clippedOverflowValues.has(layout.overflowY), `${context}: outer panel must not clip or scroll vertically (${JSON.stringify(layout)})`);
+      assert.ok(layout.scroll.width <= layout.client.width + 1, `${context}: outer panel has horizontally unreachable content (${JSON.stringify(layout)})`);
+      assert.ok(layout.scroll.height <= layout.client.height + 1, `${context}: outer panel has vertically unreachable content (${JSON.stringify(layout)})`);
+      assert.deepEqual(layout.outsidePanel, [], `${context}: visible content extends outside the panel`);
+      assert.deepEqual(layout.internallyClipped, [], `${context}: visible controls or direct content are clipped`);
+    };
 
     for (const mode of ['', 'embedded&']) {
       await open(mode + 'defer-restart');
@@ -66,7 +130,7 @@ const path = require('node:path');
       assert.equal(await tab('基础配置').getAttribute('aria-selected'), 'true');
       assert.equal(await tab('会话管理').count(), 0);
 
-      for (const client of ['claude-desktop', 'zcode', 'opencode']) {
+      for (const client of ['claude-desktop', 'zcode', 'workbuddy', 'opencode']) {
         await open(mode + 'client=' + client + '&app-only');
         assert.ok(await button('重启 App').isEnabled());
         await button('重启 App').click();
@@ -77,8 +141,56 @@ const path = require('node:path');
       await open(mode + 'not-installed');
       assert.ok(await button('启动 App').isDisabled());
       assert.ok(await button('重启 App').isDisabled());
+      for (const client of ['workbuddy', 'openclaw']) {
+        await open(mode + `client=${client}&config-only=${client}&fresh`);
+        assert.ok(await page.locator('.agent-model-trigger').isEnabled());
+        assert.ok(await button('一键接入').isEnabled());
+        assert.ok(await page.locator('.agent-launch-actions button').first().isDisabled());
+        await button('一键接入').click();
+        await page.waitForFunction(() => window.fixtureCalls.some(call => call.cmd === 'update_agent_config'));
+        assert.deepEqual((await calls('update_agent_config'))[0].args.client, client);
+      }
       await open(mode + 'client=kimi-code');
       assert.equal(await button('重启 App').count(), 0);
+
+      for (const client of ['claude-code', 'claude-desktop', 'opencode', 'openclaw', 'hermes', 'deepseek-harness', 'zcode', 'workbuddy', 'antigravity-cli', 'kimi-code', 'grok-build']) {
+        await open(mode + 'client=' + client);
+        assert.ok(await button('关闭配置修改').isEnabled());
+        await tab('配置管理').click();
+        assert.ok(await button('清除接入').isEnabled());
+        await button('清除接入').click();
+        const dialog = page.getByRole('alertdialog');
+        assert.match(await dialog.innerText(), /保留其他设置/);
+        await button('取消').click();
+        assert.equal((await calls('set_agent_config_enabled')).length, 0);
+        await button('清除接入').click();
+        await button('确认清除接入').click();
+        await dialog.waitFor({ state: 'detached' });
+        assert.deepEqual((await calls('set_agent_config_enabled')).map(call => call.args), [{
+          client, model: '', enabled: false, forceRestore: false,
+          claudeCodeModelMappings: null, claudeDesktopModelMappings: null,
+        }]);
+        assert.equal((await calls('clear_codex_config')).length, 0);
+        await tab('基础配置').click();
+        assert.equal(await button('关闭配置修改').count(), 0);
+        assert.ok(await button('一键接入').isVisible());
+      }
+      await open(mode + 'client=claude-code&state=needs-update');
+      assert.ok(await button('关闭配置修改').isEnabled());
+      await open(mode + 'client=claude-code&no-core&defer-clear');
+      await button('关闭配置修改').click();
+      await page.waitForFunction(() => !!window.fixtureFinishClear);
+      assert.ok(await tab('配置管理').isDisabled());
+      await page.evaluate(() => window.fixtureFinishClear());
+      await button('关闭配置修改').waitFor({ state: 'detached' });
+      await page.getByText('已清除 CPA 接入，请重启 Claude Code。', { exact: true }).waitFor();
+      await open(mode + 'client=claude-code&fail-clear');
+      await tab('配置管理').click();
+      await button('清除接入').click();
+      await button('确认清除接入').click();
+      await page.getByText(/模拟清除失败/).waitFor();
+      assert.ok(await page.getByRole('alertdialog').isVisible());
+      await button('取消').click();
 
       await open(mode + 'client=pi&update');
       assert.equal(await button('卸载 Pi 插件').count(), 0);
@@ -88,6 +200,11 @@ const path = require('node:path');
       assert.equal(await button('手动备份').count(), 0);
       await open(mode + 'client=pi&no-plugin');
       assert.ok(await button('安装 Pi 插件').isEnabled());
+      await open(mode + 'client=pi&config-only=pi&no-plugin&fresh');
+      assert.ok(await button('安装 Pi 插件').isEnabled());
+      assert.ok(await button('启动 CLI').isDisabled());
+      await button('安装 Pi 插件').click();
+      await page.waitForFunction(() => window.fixtureCalls.some(call => call.cmd === 'install_pi_provider'));
 
       await open(mode + 'client=deepseek-harness&running');
       await button('重启 Web').click();
@@ -103,16 +220,17 @@ const path = require('node:path');
       assert.equal((await calls('launch_agent')).length, 0);
     }
 
-    for (const width of [1280, 540]) for (const theme of ['light', 'dark']) for (const embedded of [false, true]) {
-      await page.setViewportSize({ width, height: 900 });
+    for (const { width, height } of [{ width: 1280, height: 900 }, { width: 1280, height: 941 }, { width: 540, height: 700 }]) for (const theme of ['light', 'dark']) for (const embedded of [false, true]) {
+      await page.setViewportSize({ width, height });
       await open(`theme=${theme}&locale=en${embedded ? '&embedded' : ''}`);
       for (const subpage of ['Basic configuration', 'Configuration management']) {
         await tab(subpage).click();
+        const context = `${width}x${height}/${theme}/${embedded ? 'compact' : 'full'}/${subpage}`;
         const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
-        assert.equal(overflow, false, `${width}/${theme}/${embedded}/${subpage} overflow`);
-        assert.ok(await page.locator('.agent-config-panel').evaluate(el => el.scrollHeight <= el.clientHeight + 1), 'panel content must not be clipped');
+        assert.equal(overflow, false, `${context}: document overflows horizontally`);
+        await assertPanelContentFullyVisible(context);
         assert.ok(await tab(subpage).isVisible());
-        await page.screenshot({ path: path.join(screenshots, `${width}-${theme}-${embedded ? 'compact' : 'full'}-${subpage.startsWith('Basic') ? 'core' : 'management'}.png`), fullPage: true });
+        await page.screenshot({ path: path.join(screenshots, `${width}x${height}-${theme}-${embedded ? 'compact' : 'full'}-${subpage.startsWith('Basic') ? 'core' : 'management'}.png`), fullPage: true });
       }
     }
     assert.deepEqual(errors, []);

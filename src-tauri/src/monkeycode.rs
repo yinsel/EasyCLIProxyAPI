@@ -110,12 +110,28 @@ fn key(record: &Value) -> &str {
 }
 
 fn route_id(record: &Value, section: &str) -> String {
+    // Shared-credential providers may use different signing secrets or proxy
+    // overrides. Only share a bridge route when its forwarding settings agree.
+    // Length-prefix optional fields so absent and explicitly empty overrides
+    // remain distinct. Core-added IDs, model mappings and list order are not
+    // part of the bridge identity and must not invalidate persisted routes.
     let mut hash = Sha256::new();
-    hash.update(section);
-    hash.update([0]);
-    hash.update(record["base-url"].as_str().unwrap_or_default());
-    hash.update([0]);
-    hash.update(key(record));
+    hash.update(b"monkeycode-route-v2\0");
+    for value in [
+        Some(section),
+        record["base-url"].as_str(),
+        Some(key(record)),
+        record["signing_secret"].as_str(),
+        record["proxy-url"].as_str(),
+        record
+            .pointer("/api-key-entries/0/proxy-url")
+            .and_then(Value::as_str),
+    ] {
+        hash.update([u8::from(value.is_some())]);
+        let bytes = value.unwrap_or_default().as_bytes();
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
     format!("{:x}", hash.finalize())
 }
 
@@ -813,6 +829,196 @@ mod tests {
         json!({"name":"test", "base-url":upstream,
             "signing_secret":"omas_test_secret", "api-key-entries":[{"api-key":"oma_test"}],
             "headers":{"X-Team":"test"}, "models":[{"name":"test-model"}]})
+    }
+
+    #[test]
+    fn shared_credentials_keep_distinct_forwarding_routes() {
+        let original = provider("https://mc.example/v1");
+        let id = route_id(&original, "openai-compatibility");
+        for pointer in [
+            "/signing_secret",
+            "/proxy-url",
+            "/api-key-entries/0/proxy-url",
+        ] {
+            let mut changed = original.clone();
+            if pointer.starts_with("/api-key-entries") {
+                changed["api-key-entries"][0]["proxy-url"] = json!("direct");
+            } else {
+                changed[&pointer[1..]] = json!("different-setting");
+            }
+            assert_ne!(route_id(&changed, "openai-compatibility"), id, "{pointer}");
+        }
+        // An empty key proxy suppresses the provider/global proxy fallback.
+        let mut empty_override = original.clone();
+        empty_override["api-key-entries"][0]["proxy-url"] = json!("");
+        assert_ne!(route_id(&empty_override, "openai-compatibility"), id);
+
+        let mut runtime = original;
+        runtime["auth-index"] = json!("runtime-generated");
+        runtime["priority"] = json!(10);
+        runtime["models"] = json!([{"name":"another-model"}]);
+        runtime["headers"]["X-Team"] = json!("other");
+        assert_eq!(route_id(&runtime, "openai-compatibility"), id);
+    }
+
+    #[test]
+    fn legacy_shared_routes_migrate_and_rebind_without_losing_settings() {
+        for section in SECTIONS {
+            let mut first = provider("https://mc.example/v1");
+            if section != "openai-compatibility" {
+                first.as_object_mut().unwrap().remove("api-key-entries");
+                first["api-key"] = json!("oma_test");
+            }
+            first["proxy-url"] = json!("http://proxy.example:8080");
+            let mut second = first.clone();
+            second["signing_secret"] = json!("omas_other_secret");
+            let originals = [first, second];
+            let mut legacy_hash = Sha256::new();
+            legacy_hash.update(section);
+            legacy_hash.update([0]);
+            legacy_hash.update("https://mc.example/v1");
+            legacy_hash.update([0]);
+            legacy_hash.update("oma_test");
+            let legacy_id = format!("{:x}", legacy_hash.finalize());
+            let mut records = originals.clone();
+            for record in &mut records {
+                encode_record(record, "http://127.0.0.1:12345", section).unwrap();
+                record["base-url"] =
+                    json!(format!("http://127.0.0.1:12345/monkeycode/{legacy_id}/v1"));
+            }
+            // Exercise the same persisted metadata round-trip used on restart.
+            let yaml = serde_norway::to_string(&records).unwrap();
+            let mut restored: Vec<Value> = serde_norway::from_str(&yaml).unwrap();
+            for origin in ["http://127.0.0.1:23456", "http://127.0.0.1:34567"] {
+                for (record, original) in restored.iter_mut().zip(&originals) {
+                    encode_record(record, origin, section).unwrap();
+                    let id = route_id(original, section);
+                    assert_ne!(id, legacy_id);
+                    assert!(record["base-url"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("{origin}/monkeycode/{id}")));
+                    let mut decoded = record.clone();
+                    decode_record(&mut decoded);
+                    assert_eq!(&decoded, original);
+                }
+                assert_ne!(restored[0]["base-url"], restored[1]["base-url"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_credentials_use_selected_secret_after_reorder_and_removal() {
+        let upstream = Router::new().fallback(|request: Request| async move {
+            let supplied = request.headers()[SIGNATURE_HEADER]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(!request.headers().contains_key(META_HEADER));
+            let body = to_bytes(request.into_body(), MAX_BODY).await.unwrap();
+            for secret in ["omas_first", "omas_second"] {
+                if signature(&body, secret).unwrap() == supplied {
+                    return secret.to_owned().into_response();
+                }
+            }
+            StatusCode::UNAUTHORIZED.into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        for section in SECTIONS {
+            let mut records = Vec::new();
+            let mut ids = Vec::new();
+            for secret in ["omas_first", "omas_second"] {
+                let mut record = provider(&format!("http://{address}/v1"));
+                if section != "openai-compatibility" {
+                    record.as_object_mut().unwrap().remove("api-key-entries");
+                    record["api-key"] = json!("oma_test");
+                }
+                record["signing_secret"] = json!(secret);
+                ids.push(route_id(&record, section));
+                encode_record(&mut record, "http://127.0.0.1:1", section).unwrap();
+                records.push(record);
+            }
+            let request = |index: usize| {
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/monkeycode/{}/v1/chat/completions", ids[index]))
+                    .header("authorization", "Bearer oma_test")
+                    .header("x-api-key", "oma_test")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"system","content":"test"}]}"#,
+                    ))
+                    .unwrap()
+            };
+            for order in [[0, 1], [1, 0]] {
+                let mut config = json!({});
+                config[section] = json!([records[order[0]], records[order[1]]]);
+                for (index, expected) in ["omas_first", "omas_second"].iter().enumerate() {
+                    let response = forward_with_config(request(index), config.clone())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(
+                        to_bytes(response.into_body(), MAX_BODY)
+                            .await
+                            .unwrap()
+                            .as_ref(),
+                        expected.as_bytes()
+                    );
+                }
+            }
+            let mut remaining = json!({});
+            remaining[section] = json!([records[0]]);
+            assert_eq!(
+                forward_with_config(request(1), remaining)
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_credentials_use_selected_proxy_override() {
+        let mut servers = Vec::new();
+        let mut records = Vec::new();
+        let mut ids = Vec::new();
+        for label in ["proxy-first", "proxy-second"] {
+            let app = Router::new().fallback(move || async move { label });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            let mut record = provider("http://upstream.invalid/v1");
+            record["api-key-entries"][0]["proxy-url"] = json!(format!("http://{address}"));
+            ids.push(route_id(&record, "openai-compatibility"));
+            encode_record(&mut record, "http://127.0.0.1:1", "openai-compatibility").unwrap();
+            records.push(record);
+        }
+        let config = json!({"openai-compatibility":[records[1], records[0]]});
+        for (index, label) in ["proxy-first", "proxy-second"].iter().enumerate() {
+            let request = Request::builder()
+                .uri(format!("/monkeycode/{}/v1/models", ids[index]))
+                .header("authorization", "Bearer oma_test")
+                .body(Body::empty())
+                .unwrap();
+            let response = forward_with_config(request, config.clone()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), MAX_BODY)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                label.as_bytes()
+            );
+        }
+        for server in servers {
+            server.abort();
+        }
     }
 
     #[test]

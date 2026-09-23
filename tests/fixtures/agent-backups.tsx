@@ -9,10 +9,13 @@ if(params.has('reset-selections'))localStorage.removeItem('cpa-gui.agent-model-s
 localStorage.setItem('easy-cli-proxy-api.locale',params.get('locale') || 'zh-CN');
 document.documentElement.dataset.theme = params.get('theme') || 'light';
 localStorage.setItem('cpa-gui.agent-selected-client.v1', params.get('client') || 'codex');
-const ids = ['claude-code','claude-desktop','codex','opencode','openclaw','hermes','deepseek-harness','zcode','kimi-code','grok-build','pi'];
+const ids = ['claude-code','claude-desktop','codex','opencode','openclaw','hermes','deepseek-harness','antigravity-cli','workbuddy','zcode','kimi-code','grok-build','pi'];
 let count=0; let backupCount=0; const backups:any[]=[]; let currentModel=params.has('fresh')?null:'gpt-one';
 let nativeOauth=params.has('native-oauth'); let nativeSwitchCount=0; let codexClosed=false; let closeCount=0;
 let currentOauth=false; const currentMappings:Record<string,any>={};
+if(params.has('legacy-desktop'))currentMappings['claude-desktop']={opus:'gpt-one',sonnet:'gpt-two',haiku:'gpt-one',opus1m:true};
+if(params.has('legacy-desktop-direct'))currentMappings['claude-desktop']={opus:'',sonnet:'claude-sonnet-custom-7',haiku:'',desktopModels:[{model:'',alias:'claude-sonnet-custom-7',context1m:false}]};
+if(params.has('saved-desktop-alias'))currentMappings['claude-desktop']={opus:'',sonnet:'gpt-one',haiku:'',desktopModels:[{model:'gpt-one',alias:'claude-opus-5',context1m:false}]};
 let harnessProvider:Record<string,unknown>={};
 const harnessConfigurations:Record<string,Record<string,unknown>>={};
 let harnessRevision=1;
@@ -32,7 +35,7 @@ mockIPC(async (cmd,args:any) => {
  calls.push({cmd,args});
  if(cmd==='plugin:event|listen') return 1;
  if(cmd==='plugin:event|unlisten'||cmd==='set_app_locale') return null;
- if(cmd==='get_agent_config_statuses'||cmd==='refresh_agent_config_statuses') return ids.map(id=>({id,name:id,supportedPlatform:true,installed:!params.has('not-installed'),pluginInstalled:!params.has('no-plugin'),launchTargets:params.has('not-installed')?[]:['claude-desktop','zcode'].includes(id)?[{id:'app',label:id,detail:'test desktop'}]:['codex','opencode'].includes(id)&&!params.has('cli-only')?[...(params.has('app-only')?[]:[{id:'cli',label:'CLI',detail:'test CLI'}]),{id:'app',label:'APP',detail:'test desktop'}]:[{id:'cli',label:'CLI',detail:'test CLI'}],version:'1.0',cliVersion:'1.0',appVersion:null,pluginVersion:'1.0',configValid:params.get('state')!=='invalid',connectionState:params.get('state') || (currentModel?'configured':'not-configured'),configured:!!currentModel,configurationSynchronized:!!currentModel,currentModel,oauthConfiguration:id==='codex'&&currentOauth,codexNativeOauth:id==='codex'&&nativeOauth,modificationEnabled:!!currentModel,modificationState:currentModel?'applied':'unconfigured',backupAvailable:false,appliedModel:currentModel,claudeCodeModelMappings:id==='claude-code'?currentMappings[id]??null:null,claudeDesktopModelMappings:id==='claude-desktop'?currentMappings[id]??null:null,warnings:[],error:null})).map(status=>status.id==='codex'&&(nativeOauth||codexClosed)?{...status,configured:false,connectionState:'not-configured',configurationSynchronized:false,currentModel:null,appliedModel:null,modificationEnabled:false,modificationState:'unconfigured',oauthConfiguration:false}:status);
+ if(cmd==='get_agent_config_statuses'||cmd==='refresh_agent_config_statuses') return ids.map(id=>({id,name:id,supportedPlatform:true,installed:!params.has('not-installed')&&params.get('config-only')!==id,pluginInstalled:!params.has('no-plugin'),launchTargets:params.has('not-installed')||params.get('config-only')===id?[]:['claude-desktop','zcode','workbuddy'].includes(id)?[{id:'app',label:id,detail:'test desktop'}]:['codex','opencode'].includes(id)&&!params.has('cli-only')?[...(params.has('app-only')?[]:[{id:'cli',label:'CLI',detail:'test CLI'}]),{id:'app',label:'APP',detail:'test desktop'}]:[{id:'cli',label:'CLI',detail:'test CLI'}],version:'1.0',cliVersion:'1.0',appVersion:null,pluginVersion:'1.0',configExists:!params.has('not-installed')||params.get('config-only')===id,configValid:params.get('state')!=='invalid',connectionState:params.get('state') || (currentModel?'configured':'not-configured'),configured:!!currentModel,configurationSynchronized:!!currentModel,currentModel,oauthConfiguration:id==='codex'&&currentOauth,codexNativeOauth:id==='codex'&&nativeOauth,modificationEnabled:!!currentModel,modificationState:currentModel?'applied':'unconfigured',backupAvailable:false,appliedModel:currentModel,claudeCodeModelMappings:id==='claude-code'?currentMappings[id]??null:null,claudeDesktopModelMappings:id==='claude-desktop'?currentMappings[id]??null:null,warnings:[],error:null})).map(status=>status.id==='codex'&&(nativeOauth||codexClosed)?{...status,configured:false,connectionState:'not-configured',configurationSynchronized:false,currentModel:null,appliedModel:null,modificationEnabled:false,modificationState:'unconfigured',oauthConfiguration:false}:status);
  if(cmd==='close_codex_config_modification') {
    closeCount++;
    if(params.has('fail-close')&&closeCount===1)throw new Error('模拟关闭失败，已回滚');
@@ -45,9 +48,11 @@ mockIPC(async (cmd,args:any) => {
    nativeOauth=true; return {outcome:'updated'};
  }
  if(cmd==='get_agent_models') {
+   if(params.has('no-models'))return [];
    if(params.has('no-core'))throw new Error('CPA core is offline');
    if(params.has('defer-models'))await new Promise<void>(resolve=>{(window as any).fixtureFinishModels=resolve;});
    if(args.client==='deepseek-harness')return harnessModels.map(m=>({name:m.id,inputModalities:m.defaults.input}));
+   if(params.has('claude-models')||params.has('claude-alias-models')||params.has('saved-desktop-alias'))return [{name:'gpt-one'},{name:'claude-opus-5',isAlias:!params.has('claude-models')},{name:'claude-sonnet-5',isAlias:!params.has('claude-models')}];
    return [{name:'gpt-one'},{name:'gpt-two'}];
  }
  if(cmd==='list_codex_sessions') {
@@ -70,6 +75,12 @@ mockIPC(async (cmd,args:any) => {
  if(cmd==='stop_deepseek_harness_process')return harnessStatus={running:false,pid:null,mode:null};
  if(cmd==='launch_agent')return null;
  if(cmd==='clear_codex_config') { currentModel=null; return []; }
+ if(cmd==='set_agent_config_enabled' && !args.enabled) {
+   if(params.has('fail-clear'))throw new Error('模拟清除失败，已回滚');
+   if(params.has('defer-clear'))await new Promise<void>(resolve=>{(window as any).fixtureFinishClear=resolve;});
+   currentModel=null;delete currentMappings[args.client];
+   return {outcome:'updated',enabled:false,model:null,changedFiles:[],conflictFiles:[]};
+ }
  if(cmd==='uninstall_pi_provider')return null;
  if(['update_agent_config','repair_pi_provider','install_pi_provider','update_pi_provider'].includes(cmd)) {
    count++;if(params.has('fail-apply')&&count===1)throw new Error('模拟配置写入失败');
@@ -107,6 +118,14 @@ mockIPC(async (cmd,args:any) => {
  throw new Error('Unhandled fixture command: '+cmd);
 });
 let root=createRoot(document.getElementById('root')!);
-const render=()=>root.render(<I18nProvider><AgentsPage embedded={embedded} onConfigurationApplied={()=>{document.documentElement.dataset.fixtureApplied=String(++appliedCount);}}/></I18nProvider>);
+const render=()=>{
+ const agents=<AgentsPage embedded={embedded} onConfigurationApplied={()=>{document.documentElement.dataset.fixtureApplied=String(++appliedCount);}}/>;
+ root.render(<I18nProvider>{params.has('shell')?(
+  <div className="app-shell">
+   <aside className="sidebar" aria-hidden="true" />
+   <div className="workspace"><main className="content">{agents}</main></div>
+  </div>
+ ):agents}</I18nProvider>);
+};
 (window as any).fixtureRemount=(nextEmbedded=embedded)=>{embedded=nextEmbedded;root.unmount();root=createRoot(document.getElementById('root')!);render();};
 render();

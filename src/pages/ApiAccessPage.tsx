@@ -56,9 +56,11 @@ import {
   DEEPSEEK_BASE_URL,
   fetchModels,
   mergeModelOptions,
+  modelSearchText,
   modelsFromRecord,
   normalizeBaseUrl,
   reconcileModelSelection,
+  usableModelAlias,
   type ModelOption,
   type ModelProvider,
 } from '../services/modelService';
@@ -110,8 +112,15 @@ type ProviderRow = {
   remark: string;
 };
 
-const providerDragId = (
-  row: Pick<ProviderRow, 'section' | 'name' | 'apiKey' | 'baseUrl'>,
+export type ApiAccessRemarkLocator = {
+  providerName: string;
+  baseUrl: string;
+  apiKeys: string[];
+  configIdentity?: string;
+};
+
+export const providerDragId = (
+  row: Pick<ProviderRow, 'section' | 'index' | 'name' | 'apiKey' | 'baseUrl'>,
 ) => {
   const identity = `${row.section}\u0000${row.name}\u0000${row.apiKey}\u0000${row.baseUrl}`;
   let hash = 2166136261;
@@ -119,7 +128,7 @@ const providerDragId = (
     hash ^= identity.charCodeAt(index);
     hash = Math.imul(hash, 16777619);
   }
-  return `${row.section}:${(hash >>> 0).toString(36)}`;
+  return `${row.section}:${(hash >>> 0).toString(36)}:${row.index}`;
 };
 
 function SortableProviderRow({
@@ -200,6 +209,7 @@ export type ProviderDraft = {
   baseUrl: string;
   priority: string;
   models: ModelOption[];
+  modelSelectionCatalog?: ModelOption[];
   prefix?: string;
   headersText?: string;
   excludedModelsText?: string;
@@ -320,8 +330,26 @@ const rowFromRecord = (
   };
 };
 
-const providerRemarkIdentity = (section: ProviderSection, apiKeys: string[]) =>
-  `${section}\u0000${apiKeys.join('\u0000')}`;
+export const providerRemarkIdentity = (
+  section: ProviderSection,
+  locator: ApiAccessRemarkLocator,
+) => JSON.stringify([section, locator.providerName, locator.baseUrl, locator.apiKeys, locator.configIdentity ?? '']);
+
+export const apiAccessRemarkLocatorFromRecord = (
+  section: ProviderSection,
+  record: Record<string, unknown>,
+): ApiAccessRemarkLocator => {
+  const row = rowFromRecord(section, record, 0);
+  return {
+    providerName: readString(record, 'name'),
+    baseUrl: row.baseUrl,
+    apiKeys: row.apiKeys,
+    configIdentity: providerRemarkConfigIdentity(record),
+  };
+};
+
+const apiAccessRemarkLocatorFromRow = (row: ProviderRow): ApiAccessRemarkLocator =>
+  apiAccessRemarkLocatorFromRecord(row.section, row.record);
 
 const providerHealthIdentity = (row: ProviderRow) => [
   row.section,
@@ -369,32 +397,119 @@ export const stripResponseFields = (record: Record<string, unknown>) => {
   return next;
 };
 
+const normalizeProviderIdentity = (value: unknown): unknown => {
+  if (value == null || value === '') return undefined;
+  if (Array.isArray(value)) return value.length ? value.map(normalizeProviderIdentity) : undefined;
+  if (isRecord(value)) {
+    const entries = Object.keys(value).sort().flatMap((key) => {
+      const normalized = normalizeProviderIdentity(value[key]);
+      return normalized === undefined ? [] : [[key, normalized]];
+    });
+    return entries.length ? Object.fromEntries(entries) : undefined;
+  }
+  return value;
+};
+
+const providerConfigIdentity = (record: Record<string, unknown>) => {
+  const config = stripResponseFields(record);
+  if (config.priority === 0) delete config.priority;
+  if (config.websockets === false) delete config.websockets;
+  if (config.disabled === false) delete config.disabled;
+  return JSON.stringify(normalizeProviderIdentity(config) ?? {});
+};
+
+const providerRemarkConfigIdentity = (record: Record<string, unknown>) => {
+  const config = stripResponseFields(record);
+  for (const key of ['name', 'api-key', 'apiKey', 'api-key-entries', 'base-url', 'baseUrl', 'disabled']) {
+    delete config[key];
+  }
+  if (Array.isArray(config['excluded-models'])) {
+    config['excluded-models'] = config['excluded-models'].filter((model) => String(model).trim() !== '*');
+  }
+  return providerConfigIdentity(config);
+};
+
+export const hasDuplicateProviderRecord = (
+  section: ProviderSection,
+  records: Record<string, unknown>[],
+  candidates: Record<string, unknown>[],
+  targetIndex = -1,
+) => records.some((record, index) => index !== targetIndex && candidates.some((candidate) => {
+  if (definitionFor(section).openAi) return readString(record, 'name') === readString(candidate, 'name');
+  if (section === 'gemini-api-key') {
+    return readString(record, 'api-key', 'apiKey') === readString(candidate, 'api-key', 'apiKey')
+      && readString(record, 'base-url', 'baseUrl') === readString(candidate, 'base-url', 'baseUrl');
+  }
+  return providerConfigIdentity(record) === providerConfigIdentity(candidate);
+}));
+
 const mergeModelRecords = (current: unknown, selected: ModelOption[]) => {
   const existing = Array.isArray(current) ? current : [];
+  const consumedExistingIndexes = new Set<number>();
+  const selectedNames = new Set<string>();
   const seen = new Set<string>();
-  return selected.reduce<Record<string, unknown>[]>((models, model) => {
+  const models = selected.reduce<Record<string, unknown>[]>((result, model) => {
     const name = model.name.trim();
     const key = name.toLowerCase();
-    if (!name || seen.has(key)) return models;
+    if (!name || seen.has(key)) return result;
     seen.add(key);
-    const matched = existing.find(
-      (item) => isRecord(item) && readString(item, 'name').toLowerCase() === name.toLowerCase(),
-    );
+    selectedNames.add(key);
+    const requested = (model.alias ?? '').trim();
+    const requestedAlias = requested.toLowerCase();
+    let matchedIndex = existing.findIndex((item, index) => (
+      !consumedExistingIndexes.has(index)
+      && isRecord(item)
+      && readString(item, 'name').toLowerCase() === key
+      && readString(item, 'alias').toLowerCase() === requestedAlias
+    ));
+    if (matchedIndex < 0) {
+      matchedIndex = existing.findIndex((item, index) => (
+        !consumedExistingIndexes.has(index)
+        && isRecord(item)
+        && readString(item, 'name').toLowerCase() === key
+      ));
+    }
+    if (matchedIndex >= 0) consumedExistingIndexes.add(matchedIndex);
+    const matched = matchedIndex >= 0 ? existing[matchedIndex] : undefined;
     const next: Record<string, unknown> = isRecord(matched) ? { ...matched } : {};
     next.name = name;
-    const alias = model.alias?.trim();
-    if (alias && alias !== name) next.alias = alias;
-    else delete next.alias;
+    const storedAlias = readString(next, 'alias');
+    const alias = usableModelAlias(requested);
+    if (alias && alias !== name) {
+      next.alias = alias;
+    } else if (
+      requested
+      && storedAlias
+      && requested.toLowerCase() === storedAlias.toLowerCase()
+      && requested.toLowerCase() !== name.toLowerCase()
+    ) {
+      next.alias = storedAlias;
+    } else if (requested && requested !== name) {
+      throw new Error(translate(getCurrentLocale(), 'aliases.error.invalidAlias'));
+    } else {
+      delete next.alias;
+    }
     if (model.thinking) next.thinking = { ...model.thinking };
-    models.push(next);
-    return models;
+    result.push(next);
+    return result;
   }, []);
+
+  existing.forEach((item, index) => {
+    if (
+      consumedExistingIndexes.has(index)
+      || !isRecord(item)
+      || !selectedNames.has(readString(item, 'name').toLowerCase())
+    ) return;
+    models.push({ ...item });
+  });
+
+  return models;
 };
 
 export const exclusionsForModelSelection = (
   currentText: string,
   discoveredModels: ModelOption[],
-  selectedModelNames: Iterable<string>,
+  selectedModels: ModelOption[],
 ) => {
   const discovered = new Map<string, string>();
   discoveredModels.forEach((model) => {
@@ -402,7 +517,12 @@ export const exclusionsForModelSelection = (
     if (name && !discovered.has(name.toLowerCase())) discovered.set(name.toLowerCase(), name);
   });
   const selected = new Set(
-    Array.from(selectedModelNames, (name) => name.trim().toLowerCase()).filter(Boolean),
+    selectedModels.map((model) => model.name.trim().toLowerCase()).filter(Boolean),
+  );
+  const selectedClientNames = new Set(
+    selectedModels
+      .filter((model) => model.name.trim())
+      .map((model) => (model.alias?.trim() || model.name.trim()).toLowerCase()),
   );
   const rules = currentText
     .split(/[,\n]/)
@@ -412,7 +532,7 @@ export const exclusionsForModelSelection = (
 
   if (selected.size > 0) {
     discovered.forEach((name, key) => {
-      if (!selected.has(key)) next.push(name);
+      if (!selected.has(key) && !selectedClientNames.has(key)) next.push(name);
     });
   }
 
@@ -620,7 +740,17 @@ const applyAdvancedFields = (
     else delete next.headers;
   }
   if (draft.excludedModelsText !== undefined && section !== 'openai-compatibility') {
-    const excludedModels = draft.excludedModelsText
+    const excludedModelsText = draft.modelSelectionCatalog && draft.models.some((model) => model.name.trim())
+      ? exclusionsForModelSelection(
+          draft.excludedModelsText,
+          draft.modelSelectionCatalog,
+          (Array.isArray(next.models) ? next.models : []).filter(isRecord).map((model) => ({
+            name: readString(model, 'name'),
+            alias: readString(model, 'alias'),
+          })),
+        )
+      : draft.excludedModelsText;
+    const excludedModels = excludedModelsText
       .split(/[,\n]/)
       .map((value) => value.trim())
       .filter((value, index, values) =>
@@ -734,7 +864,7 @@ const providerIdentityMatches = (
 export type ProviderRecordIdentity = Pick<
   ProviderRow,
   'section' | 'index' | 'name' | 'apiKey' | 'baseUrl'
->;
+> & Partial<Pick<ProviderRow, 'record'>>;
 
 const providerPrimaryIdentityMatches = (
   row: ProviderRecordIdentity,
@@ -747,8 +877,29 @@ export const resolveProviderRecordIndex = (
   records: Record<string, unknown>[],
   row: ProviderRecordIdentity,
 ) => {
-  const exactIndex = records.findIndex((record) => providerIdentityMatches(row, record));
-  if (exactIndex >= 0) return exactIndex;
+  if (row.record) {
+    const identity = providerConfigIdentity(row.record);
+    const matches = records.flatMap((record, index) => (
+      providerConfigIdentity(record) === identity ? [index] : []
+    ));
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) return matches.includes(row.index) ? row.index : -1;
+
+    const withoutBaseUrl = (record: Record<string, unknown>) => {
+      const { 'base-url': _baseUrl, baseUrl: _camelBaseUrl, ...rest } = record;
+      return providerConfigIdentity(rest);
+    };
+    const defaultUrlMatches = records.flatMap((record, index) => (
+      providerPrimaryIdentityMatches(row, record)
+      && (!readString(record, 'base-url', 'baseUrl') || !row.baseUrl)
+      && withoutBaseUrl(record) === withoutBaseUrl(row.record!) ? [index] : []
+    ));
+    return defaultUrlMatches.length === 1 ? defaultUrlMatches[0] : -1;
+  }
+
+  const exactMatches = records.flatMap((record, index) => providerIdentityMatches(row, record) ? [index] : []);
+  if (exactMatches.length === 1) return exactMatches[0];
+  if (exactMatches.length > 1) return -1;
 
   const indexedRecord = records[row.index];
   if (indexedRecord && providerPrimaryIdentityMatches(row, indexedRecord)) {
@@ -766,7 +917,9 @@ export const deleteProviderRecord = async (row: ProviderRecordIdentity) => {
   const records = responseList(await managementApi.get(path), row.section);
   const matches = records
     .map((record, index) => ({ record, index }))
-    .filter(({ record }) => providerIdentityMatches(row, record));
+    .filter(({ record }) => row.record
+      ? providerConfigIdentity(record) === providerConfigIdentity(row.record)
+      : providerIdentityMatches(row, record));
   // Do not fall back to a stale index or an API key shared by another endpoint.
   if (matches.length !== 1) {
     throw new Error(translate(getCurrentLocale(), 'apiAccess.error.stale'));
@@ -774,6 +927,7 @@ export const deleteProviderRecord = async (row: ProviderRecordIdentity) => {
   // MonkeyCode restores the upstream URL for display, while the core stores a
   // loopback bridge URL. Delete by the freshly resolved index, not the UI URL.
   await managementApi.delete(path, { query: { index: matches[0].index } });
+  return records.filter((_, index) => index !== matches[0].index).map(stripResponseFields);
 };
 
 export const reorderProviderRecords = (
@@ -900,12 +1054,12 @@ export function ApiAccessPage() {
     void invoke<string[]>('resolve_api_access_remarks', {
       queries: providerRows.map((row) => ({
         providerSection: row.section,
-        apiKeys: row.apiKeys,
+        ...apiAccessRemarkLocatorFromRow(row),
       })),
     }).then((remarks) => {
       if (disposed) return;
       setApiAccessRemarks(Object.fromEntries(providerRows.map((row, index) => [
-        providerRemarkIdentity(row.section, row.apiKeys),
+        providerRemarkIdentity(row.section, apiAccessRemarkLocatorFromRow(row)),
         remarks[index] ?? '',
       ])));
     }).catch(() => {
@@ -925,7 +1079,9 @@ export function ApiAccessPage() {
           name: activeCategory === 'deepseek'
             ? t('apiAccess.provider.deepseek')
             : row.name,
-          remark: apiAccessRemarks[providerRemarkIdentity(row.section, row.apiKeys)] ?? '',
+          remark: apiAccessRemarks[
+            providerRemarkIdentity(row.section, apiAccessRemarkLocatorFromRow(row))
+          ] ?? '',
         }))
         .filter((row) => providerCategoryMatchesRecord(activeCategory, row.record, activeSection))
         .filter((row) => {
@@ -1059,16 +1215,6 @@ export function ApiAccessPage() {
         currentRecord = current[targetIndex];
       }
 
-      const duplicate = current.some((record, index) => {
-        if (index === targetIndex) return false;
-        if (definition.openAi) return readString(record, 'name') === preparedDraft.name.trim();
-        return parsedApiKeys.some((apiKey) => (
-          readString(record, 'api-key', 'apiKey').trim() === apiKey
-          && readString(record, 'base-url', 'baseUrl').trim() === baseUrl
-        ));
-      });
-      if (duplicate) throw new Error(t('apiAccess.error.duplicate'));
-
       const recordsToSave = definition.openAi
         ? [buildProviderRecord(activeSection, draftToSave, currentRecord)]
         : parsedApiKeys.map((apiKey) => buildProviderRecord(
@@ -1076,6 +1222,9 @@ export function ApiAccessPage() {
           { ...draftToSave, apiKey },
           currentRecord,
         ));
+      if (hasDuplicateProviderRecord(activeSection, current, recordsToSave, targetIndex)) {
+        throw new Error(t('apiAccess.error.duplicate'));
+      }
       nextList = editingRow
         ? [
           ...current.slice(0, targetIndex),
@@ -1088,8 +1237,13 @@ export function ApiAccessPage() {
       await invoke('save_api_access_remark', {
         update: {
           providerSection: activeSection,
-          previousApiKeys: editingRow?.apiKeys ?? [],
-          apiKeys: parsedApiKeys,
+          previousRecords: editingRow ? [apiAccessRemarkLocatorFromRow(editingRow)] : [],
+          records: recordsToSave.map((record) => (
+            apiAccessRemarkLocatorFromRecord(activeSection, record)
+          )),
+          allRecords: nextList.map((record) => (
+            apiAccessRemarkLocatorFromRecord(activeSection, record)
+          )),
           remark: draftToSave.remark,
         },
       });
@@ -1109,12 +1263,15 @@ export function ApiAccessPage() {
     setBusy(true);
     setError('');
     try {
-      await deleteProviderRecord(row);
+      const remainingRecords = await deleteProviderRecord(row);
       await invoke('save_api_access_remark', {
         update: {
           providerSection: row.section,
-          previousApiKeys: row.apiKeys,
-          apiKeys: [],
+          previousRecords: [apiAccessRemarkLocatorFromRow(row)],
+          records: [],
+          allRecords: remainingRecords.map((record) => (
+            apiAccessRemarkLocatorFromRecord(row.section, record)
+          )),
           remark: '',
         },
       });
@@ -1437,9 +1594,7 @@ function ProviderHealthDialog({ row, onClose }: ProviderHealthDialogProps) {
   const visibleModels = useMemo(() => {
     const query = search.trim().toLowerCase();
     if (!query) return models;
-    return models.filter((model) =>
-      `${model.name} ${model.alias ?? ''}`.toLowerCase().includes(query),
-    );
+    return models.filter((model) => modelSearchText(model).includes(query));
   }, [models, search]);
 
   const resultValues = Object.values(results);
@@ -1551,8 +1706,8 @@ function ProviderHealthDialog({ row, onClose }: ProviderHealthDialogProps) {
                   <strong title={model.name}>{model.name}</strong>
                   {error
                     ? <small className="error" title={error}>{error}</small>
-                    : model.alias
-                      ? <small title={model.alias}>{model.alias}</small>
+                    : model.alias || model.displayName
+                      ? <small title={model.alias || model.displayName}>{model.alias || model.displayName}</small>
                       : null}
                 </div>
                 <span
@@ -1698,7 +1853,11 @@ export function ApiProviderDialog({
       setModelError('');
       if (activeCategory === 'deepseek') setModelDiscoveryReady(false);
     }
-    setDraft((current) => ({ ...current, [field]: value }));
+    setDraft((current) => ({
+      ...current,
+      [field]: value,
+      ...(field === 'excludedModelsText' ? { modelSelectionCatalog: undefined } : {}),
+    }));
   };
 
   const updateBooleanField = (
@@ -1709,27 +1868,31 @@ export function ApiProviderDialog({
     setDraft((current) => ({ ...current, [field]: value }));
   };
 
+  const updateModels = (update: (models: ModelOption[]) => ModelOption[]) => {
+    setDraft((current) => {
+      const models = update(current.models);
+      return {
+        ...current,
+        models,
+        excludedModelsText: current.modelSelectionCatalog && models.some((model) => model.name.trim())
+          ? exclusionsForModelSelection(current.excludedModelsText ?? '', current.modelSelectionCatalog, models)
+          : current.excludedModelsText,
+      };
+    });
+  };
+
   const updateModel = (index: number, patch: Partial<ModelOption>) => {
-    setDraft((current) => ({
-      ...current,
-      models: current.models.map((model, modelIndex) =>
-        modelIndex === index ? { ...model, ...patch } : model,
-      ),
-    }));
+    updateModels((models) => models.map((model, modelIndex) =>
+      modelIndex === index ? { ...model, ...patch } : model,
+    ));
   };
 
   const addModel = () => {
-    setDraft((current) => ({
-      ...current,
-      models: [...current.models, { name: '', alias: '' }],
-    }));
+    updateModels((models) => [...models, { name: '', alias: '' }]);
   };
 
   const removeModel = (index: number) => {
-    setDraft((current) => ({
-      ...current,
-      models: current.models.filter((_, modelIndex) => modelIndex !== index),
-    }));
+    updateModels((models) => models.filter((_, modelIndex) => modelIndex !== index));
   };
 
   const addThinkingLevel = () => {
@@ -1833,12 +1996,13 @@ export function ApiProviderDialog({
     setDraft((current) => ({
       ...current,
       models: selectedModels,
+      modelSelectionCatalog: activeSection === 'openai-compatibility' ? undefined : discoveredModels,
       excludedModelsText: activeSection === 'openai-compatibility'
         ? current.excludedModelsText
         : exclusionsForModelSelection(
             current.excludedModelsText ?? '',
             discoveredModels,
-            selectedModelNames,
+            selectedModels,
           ),
     }));
     closeModelDiscovery();
@@ -1999,8 +2163,8 @@ export function ApiProviderDialog({
           <div className="provider-advanced-fields">
             {activeSection !== 'gemini-api-key' ? (
               <label>
-                <span>MonkeyCode 支持</span>
-                <input type="password" autoComplete="new-password" spellCheck={false} value={draft.signingSecret ?? ''} onChange={(event) => updateTextField('signingSecret', event.currentTarget.value)} placeholder="omas_..." />
+                <span>{t('apiAccess.monkeycode.title')}</span>
+                <input type="password" autoComplete="new-password" spellCheck={false} value={draft.signingSecret ?? ''} onChange={(event) => updateTextField('signingSecret', event.currentTarget.value)} placeholder={t('apiAccess.monkeycode.secretPlaceholder')} />
                 <small>{t('apiAccess.monkeycode.secretHint')}</small>
               </label>
             ) : null}

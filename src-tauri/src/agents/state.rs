@@ -727,6 +727,10 @@ pub(crate) fn fresh_agent_contents_with_oauth(
             build_deepseek_harness_settings(None, &openai_base, model, models)?,
             build_deepseek_harness_credentials(None, api_key)?,
         ]),
+        AgentClient::AntigravityCli => Err("Antigravity 模板需要安装和用户目录信息".into()),
+        AgentClient::WorkBuddy => Ok(vec![build_workbuddy_agent_config(
+            None, &openai_base, api_key, model, models,
+        )?]),
         AgentClient::ZCode => Ok(vec![
             build_zcode_agent_config(None, &root_base, api_key, model, models)?,
             build_zcode_cli_agent_config(None, &root_base, api_key, model, models)?,
@@ -1458,7 +1462,13 @@ pub(crate) fn apply_agent_configuration_with_oauth(
     validate_config_images(&before)?;
     let mappings = options.claude_desktop_model_mappings;
     let updates = build_agent_updates_with_oauth(client, home, port, api_key, model, options)
-        .map_err(|_| "配置构建失败，请检查配置结构或使用手动备份恢复、基础配置模板修复".to_string())?;
+        .map_err(|error| {
+            if client == AgentClient::WorkBuddy {
+                error
+            } else {
+                "配置构建失败，请检查配置结构或使用手动备份恢复、基础配置模板修复".to_string()
+            }
+        })?;
     config_updates(client.id(), home, &before, &updates, "update", Some(model.to_string()), mappings)
 }
 
@@ -1531,6 +1541,9 @@ pub(crate) fn build_agent_template_updates(
         claude_code_model_mappings,
         claude_desktop_model_mappings,
     } = request;
+    if client == AgentClient::AntigravityCli {
+        return build_antigravity_updates(client, home, &managed_core_loopback_origin(port), api_key, model, true);
+    }
     let paths = agent_config_paths(client, home);
     let contents = fresh_agent_contents_with_oauth(
         client,

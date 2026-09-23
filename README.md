@@ -139,12 +139,16 @@ proxy. Supported clients include:
 - Hermes Agent
 - Pi (with the CLIProxyAPI provider extension)
 - ZCode
+- WorkBuddy / WorkBuddy AI
+- Antigravity CLI
 - Kimi Code
 - Grok Build
 
 For supported clients, the application can synchronize the available model catalog, select a
 default model, back up the original configuration before applying managed settings, and restore the
 previous configuration.
+
+Antigravity CLI connects through CPA's Gemini-compatible API. Launch the CLI from CPA to supply its endpoint and API key for that process. Running `agy` directly requires setting those environment variables yourself.
 
 ## Additional Capabilities
 

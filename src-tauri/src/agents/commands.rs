@@ -29,6 +29,8 @@ pub(crate) fn inspect_agent_config_statuses(
         AgentStatusDetectionTarget::Client(AgentClient::Hermes),
         AgentStatusDetectionTarget::Client(AgentClient::DeepSeekHarness),
         AgentStatusDetectionTarget::Client(AgentClient::ZCode),
+        AgentStatusDetectionTarget::Client(AgentClient::WorkBuddy),
+        AgentStatusDetectionTarget::Client(AgentClient::AntigravityCli),
         AgentStatusDetectionTarget::Client(AgentClient::KimiCode),
         AgentStatusDetectionTarget::Client(AgentClient::GrokBuild),
         AgentStatusDetectionTarget::PiProvider,
@@ -200,14 +202,23 @@ pub(crate) async fn install_pi_provider(
         .home_dir()
         .map_err(|error| format!("无法获取用户目录: {error}"))?;
     let config = gui_config_state.snapshot()?;
-    let executable = find_pi_executable(&home)
-        .ok_or_else(|| "未检测到 Pi CLI，请先安装 Pi 并确保 pi 命令在 PATH 中".to_string())?;
+    let executable = find_pi_executable(&home);
+    if executable.is_none()
+        && !inspect_pi_provider_status(&home, config.port, effective_agent_api_key(&config))
+            .config_exists
+    {
+        return Err("未检测到 Pi CLI 或 Pi 配置文件".to_string());
+    }
     let model = resolve_pi_default_model(&config, &model).await?;
     let port = config.port;
     let api_key = effective_agent_api_key(&config).to_string();
     let proxy_url = config.proxy_url.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        install_pi_provider_inner(&home, &executable, port, &api_key, &model, &proxy_url)
+        if let Some(executable) = executable {
+            install_pi_provider_inner(&home, &executable, port, &api_key, &model, &proxy_url)
+        } else {
+            configure_pi_provider_without_cli_inner(&home, port, &api_key, &model)
+        }
     })
     .await
     .map_err(|error| format!("安装 Pi CLIProxyAPI provider 任务失败: {error}"))??;
@@ -498,7 +509,7 @@ pub(crate) async fn get_model_alias_edit_source(
     alias: String,
 ) -> Result<ModelAliasEditContext, String> {
     let config = gui_config_state.snapshot()?;
-    let alias = validate_thinking_alias_model_id(&alias, "别名模型")?;
+    let alias = existing_thinking_alias_model_id(&alias, "别名模型")?;
     let content = fetch_management_config_yaml(&config).await?;
     let definitions = fetch_oauth_model_definitions(&config).await;
     model_alias_edit_context(&content, &alias, &definitions)
@@ -519,7 +530,16 @@ pub(crate) async fn create_thinking_alias(
     if source_id.is_empty() {
         return Err("请先选择原模型".to_string());
     }
-    let alias = validate_thinking_alias_model_id(&alias, "别名模型")?;
+    let original_alias = original_alias
+        .as_deref()
+        .map(|original| existing_thinking_alias_model_id(original, "别名模型"))
+        .transpose()?;
+    let alias = match original_alias.as_deref() {
+        Some(original) if original.eq_ignore_ascii_case(alias.trim()) => {
+            existing_thinking_alias_model_id(&alias, "别名模型")?
+        }
+        _ => validate_thinking_alias_model_id(&alias, "别名模型")?,
+    };
     let effort = if effort.trim().is_empty() {
         String::new()
     } else {
@@ -594,7 +614,7 @@ pub(crate) async fn delete_thinking_alias(
     oauth_channel: Option<String>,
 ) -> Result<Vec<ThinkingAliasEntry>, String> {
     let config = gui_config_state.snapshot()?;
-    let alias = validate_thinking_alias_model_id(&alias, "别名模型")?;
+    let alias = existing_thinking_alias_model_id(&alias, "别名模型")?;
     let content = fetch_management_config_yaml(&config).await?;
     let updated =
         remove_thinking_alias_from_yaml_for_channel(&content, &alias, oauth_channel.as_deref())?;
@@ -690,7 +710,7 @@ pub(crate) async fn delete_speed_alias(
     oauth_channel: Option<String>,
 ) -> Result<Vec<SpeedAliasEntry>, String> {
     let config = gui_config_state.snapshot()?;
-    let alias = validate_thinking_alias_model_id(&alias, "别名模型")?;
+    let alias = existing_thinking_alias_model_id(&alias, "别名模型")?;
     let content = fetch_management_config_yaml(&config).await?;
     let updated =
         remove_speed_alias_from_yaml_for_channel(&content, &alias, oauth_channel.as_deref())?;
@@ -707,6 +727,7 @@ pub(crate) async fn fetch_agent_models(
     }
     let tls_enabled = managed_core_tls_enabled();
     let client = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(15))
         .danger_accept_invalid_certs(tls_enabled)
@@ -760,6 +781,7 @@ pub(crate) async fn fetch_codex_runtime_models(
     }
     let tls_enabled = managed_core_tls_enabled();
     let client = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(15))
         .danger_accept_invalid_certs(tls_enabled)
@@ -945,8 +967,29 @@ pub(crate) fn start_codex_model_catalog_sync(app: tauri::AppHandle) {
 pub(crate) fn agent_uses_cpa_runtime_context_windows(client: AgentClient) -> bool {
     matches!(
         client,
-        AgentClient::ZCode | AgentClient::KimiCode | AgentClient::GrokBuild
+        AgentClient::ZCode | AgentClient::WorkBuddy | AgentClient::KimiCode | AgentClient::GrokBuild
     )
+}
+
+fn resolve_claude_desktop_source_model(models: &[AgentModelOption], value: &str) -> Result<String, String> {
+    let model = validate_agent_model(value)?;
+    Ok(models.iter().find(|entry| entry.name.eq_ignore_ascii_case(&model))
+        .map(|entry| entry.name.clone()).unwrap_or(model))
+}
+
+pub(crate) fn resolve_agent_configuration_model(
+    client: AgentClient,
+    models: &[AgentModelOption],
+    model: &str,
+    desktop_mappings: Option<&ClaudeDesktopModelMappings>,
+) -> Result<String, String> {
+    if client == AgentClient::ClaudeDesktop {
+        if let Some(entries) = desktop_mappings.and_then(|mappings| mappings.desktop_models.as_ref()) {
+            validate_claude_desktop_entries(entries)?;
+            return resolve_claude_desktop_source_model(models, entries[0].source_or_alias());
+        }
+    }
+    resolve_available_agent_model(models, &validate_agent_model(model)?)
 }
 
 pub(crate) fn resolve_claude_desktop_model_mappings(
@@ -958,10 +1001,26 @@ pub(crate) fn resolve_claude_desktop_model_mappings(
     if client != AgentClient::ClaudeDesktop {
         return Ok(None);
     }
-    let requested = requested.ok_or("请重新选择 Claude Desktop 的模型映射")?;
+    let mut requested = requested.ok_or("请重新配置 Claude Desktop 的模型与别名")?;
     let resolve =
         |model: &str| resolve_available_agent_model(models, &validate_agent_model(model)?);
+    if let Some(entries) = requested.desktop_models.as_mut() {
+        validate_claude_desktop_entries(entries)?;
+        for entry in entries.iter_mut() {
+            entry.model = resolve_claude_desktop_source_model(models, entry.source_or_alias())?;
+            entry.alias = if entry.alias.trim().eq_ignore_ascii_case(&entry.model) {
+                String::new()
+            } else {
+                entry.alias.trim().to_string()
+            };
+        }
+        requested.sonnet = entries[0].source_or_alias().to_string();
+        requested.opus.clear();
+        requested.haiku.clear();
+        return Ok(Some(requested));
+    }
     Ok(Some(ClaudeDesktopModelMappings {
+        desktop_models: None,
         opus: resolve(&requested.opus)?,
         sonnet: resolve(&requested.sonnet)?,
         haiku: resolve(&requested.haiku)?,
@@ -998,6 +1057,7 @@ pub(crate) fn resolve_claude_code_model_mappings(
     let resolve =
         |model: &str| resolve_available_agent_model(models, &validate_agent_model(model)?);
     Ok(Some(ClaudeDesktopModelMappings {
+        desktop_models: None,
         opus: resolve(&requested.opus)?,
         sonnet: resolve(&requested.sonnet)?,
         haiku: resolve(&requested.haiku)?,
@@ -1050,7 +1110,9 @@ pub(crate) async fn apply_agent_config(
     }
     validate_agent_can_enable(client, &home, config.port, api_key)?;
     let prepared = fetch_prepared_agent_models(client, &config).await?;
-    let model = resolve_available_agent_model(&prepared.models, &validate_agent_model(&model)?)?;
+    let model = resolve_agent_configuration_model(
+        client, &prepared.models, &model, claude_desktop_model_mappings.as_ref(),
+    )?;
     let claude_code_model_mappings = resolve_claude_code_model_mappings(
         client,
         &prepared.models,
@@ -1113,15 +1175,15 @@ pub(crate) async fn set_agent_config_enabled(
         .path()
         .home_dir()
         .map_err(|error| format!("无法获取用户目录: {error}"))?;
-    let config = gui_config_state.snapshot()?;
-    let port = config.port;
-    let api_key = effective_agent_api_key(&config);
-
     if enabled {
+        let config = gui_config_state.snapshot()?;
+        let port = config.port;
+        let api_key = effective_agent_api_key(&config);
         validate_agent_can_enable(client, &home, port, api_key)?;
         let prepared = fetch_prepared_agent_models(client, &config).await?;
-        let model =
-            resolve_available_agent_model(&prepared.models, &validate_agent_model(&model)?)?;
+        let model = resolve_agent_configuration_model(
+            client, &prepared.models, &model, claude_desktop_model_mappings.as_ref(),
+        )?;
         let claude_code_model_mappings = resolve_claude_code_model_mappings(
             client,
             &prepared.models,
@@ -1159,11 +1221,14 @@ pub(crate) async fn set_agent_config_enabled(
             )
         }).await
     } else {
+        let config = gui_config_state.snapshot()?;
         let _guard = AGENT_CONFIG_FILE_LOCK
             .lock()
             .map_err(|_| "智能体配置文件锁已损坏".to_string())?;
         let _ = force_restore;
-        Err("停用智能体配置接口已移除；如需整体重置，请使用“基础配置模板”".to_string())
+        let result = clear_agent_managed_configuration(client, &home, config.port)?;
+        app.state::<AgentConfigStatusCache>().clear()?;
+        Ok(result)
     }
 }
 
@@ -1201,7 +1266,7 @@ pub(crate) fn validate_agent_can_enable(
         ));
     }
     let detection = inspect_agent_config(client, home, port, api_key);
-    if !detection.installed {
+    if !detection.installed && !detection.config_exists {
         return Err(format!("{} is not installed", client.name()));
     }
     Ok(())
@@ -1367,7 +1432,13 @@ pub(crate) fn mark_configured_agent_model_aliases(
             let configured_models = configured_models
                 .as_sequence()
                 .ok_or_else(|| format!("{section}.models 必须是数组"))?;
-            mark_agent_model_aliases_from_sequence(models, configured_models);
+            for configured in configured_models {
+                if configured_model_identity(configured).is_some_and(|(_, client_model, _)| {
+                    configured_provider_model_is_enabled(provider, &client_model)
+                }) {
+                    mark_agent_model_aliases_from_sequence(models, std::slice::from_ref(configured));
+                }
+            }
         }
     }
 

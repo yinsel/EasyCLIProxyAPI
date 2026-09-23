@@ -48,6 +48,32 @@ function mockCore(section: string, initial: Record<string, unknown>[]) {
 }
 
 describe('provider deletion', () => {
+  it('deletes only the selected shared-credential configuration after a reorder and returns remaining remark records', async () => {
+    const first = { 'api-key': target.apiKey, 'base-url': target.baseUrl, priority: 10, 'auth-index': 'first' };
+    const second = { ...first, priority: 1, 'auth-index': 'second' };
+    const core = mockCore(target.section, [second, first]);
+
+    const remaining = await deleteProviderRecord({ ...target, index: 1, record: second });
+
+    expect(core.remove).toHaveBeenCalledWith('/codex-api-key', { query: { index: 0 } });
+    expect(core.records()).toEqual([first]);
+    expect(remaining).toEqual([{ 'api-key': target.apiKey, 'base-url': target.baseUrl, priority: 10 }]);
+  });
+
+  it('refuses a changed configuration with the same credentials', async () => {
+    const record = { 'api-key': target.apiKey, 'base-url': target.baseUrl, priority: 10 };
+    const core = mockCore(target.section, [{ ...record, priority: 1 }]);
+    await expect(deleteProviderRecord({ ...target, record })).rejects.toThrow();
+    expect(core.remove).not.toHaveBeenCalled();
+  });
+
+  it('refuses indistinguishable full-record matches', async () => {
+    const record = { 'api-key': target.apiKey, 'base-url': target.baseUrl, priority: 10 };
+    const core = mockCore(target.section, [record, record]);
+    await expect(deleteProviderRecord({ ...target, record })).rejects.toThrow();
+    expect(core.remove).not.toHaveBeenCalled();
+  });
+
   it('removes the last MonkeyCode Codex entry despite its stored bridge URL', async () => {
     const core = mockCore(target.section, [{
       'api-key': target.apiKey,

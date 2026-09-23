@@ -13,6 +13,8 @@ fn configuration_paths_ignore_inherited_environment() {
         "hermes",
         "deepseek-harness",
         "zcode",
+        "workbuddy",
+        "antigravity-cli",
         "kimi-code",
         "grok-build",
         "pi",
@@ -35,6 +37,7 @@ fn configuration_paths_ignore_inherited_environment() {
         command.env("CPA_PATH_ISOLATION_CHILD", "1");
         for variable in [
             "LOCALAPPDATA",
+            "APPDATA",
             "XDG_CONFIG_HOME",
             "CODEX_HOME",
             "HERMES_HOME",
@@ -42,6 +45,9 @@ fn configuration_paths_ignore_inherited_environment() {
             "KIMI_CODE_HOME",
             "GROK_HOME",
             "DSH_HOME",
+            "WORKBUDDY_CONFIG_DIR",
+            "CODEBUDDY_CONFIG_DIR",
+            "WORKBUDDY_INSTALL_DIR",
             "PI_CODING_AGENT_DIR",
         ] {
             command.env(variable, &outside);
@@ -109,14 +115,23 @@ fn zcode_windows_finds_custom_installations_from_registered_paths() {
             format!("{} /allusers", uninstaller.display()),
         ),
     ] {
-        let output = serde_json::json!([{ "kind": kind, "value": value }]).to_string();
         assert_eq!(
-            parse_windows_zcode_discovery_output(&output),
+            parse_windows_zcode_registration(kind, &value),
             Some(executable.clone()),
-            "{output}",
+            "kind={kind}, value={value}",
         );
     }
     fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn zcode_windows_display_name_matches_installer_variants() {
+    assert!(windows_display_name_matches_zcode("ZCode"));
+    assert!(windows_display_name_matches_zcode("ZCode (64-bit)"));
+    assert!(windows_display_name_matches_zcode("ZCode Desktop"));
+    assert!(!windows_display_name_matches_zcode("ZCodeHelper"));
+    assert!(!windows_display_name_matches_zcode("MyZCode"));
 }
 
 #[cfg(target_os = "windows")]
@@ -128,26 +143,27 @@ fn zcode_windows_skips_stale_and_unrelated_registration_entries() {
     let executable = home.join("valid/ZCode.exe");
     fs::create_dir_all(executable.parent().unwrap()).unwrap();
     fs::write(&executable, []).unwrap();
-    let mut candidates = vec![
-        serde_json::json!({ "kind": "directory", "value": home }),
-        serde_json::json!({ "kind": "executable", "value": unrelated }),
-        serde_json::json!({ "kind": "executable", "value": home.join("missing/ZCode.exe") }),
-        serde_json::json!({ "kind": "executable", "value": "ZCode.exe" }),
-        serde_json::json!({ "kind": "executable", "value": "\"unterminated" }),
-        serde_json::json!({ "kind": "unknown", "value": executable }),
-        serde_json::json!({ "kind": "executable", "value": null }),
-    ];
+    for (kind, value) in [
+        ("directory", path_to_string(&home)),
+        ("executable", path_to_string(&unrelated)),
+        (
+            "executable",
+            path_to_string(&home.join("missing/ZCode.exe")),
+        ),
+        ("executable", "ZCode.exe".to_string()),
+        ("executable", "\"unterminated".to_string()),
+        ("unknown", path_to_string(&executable)),
+    ] {
+        assert_eq!(
+            parse_windows_zcode_registration(kind, &value),
+            None,
+            "kind={kind}, value={value}",
+        );
+    }
     assert_eq!(
-        parse_windows_zcode_discovery_output(&serde_json::to_string(&candidates).unwrap()),
-        None,
-    );
-    candidates.push(serde_json::json!({ "kind": "executable", "value": executable }));
-    assert_eq!(
-        parse_windows_zcode_discovery_output(&serde_json::to_string(&candidates).unwrap()),
+        parse_windows_zcode_registration("executable", &path_to_string(&executable)),
         Some(executable),
     );
-    assert_eq!(parse_windows_zcode_discovery_output("[]"), None);
-    assert_eq!(parse_windows_zcode_discovery_output("invalid JSON"), None);
     fs::remove_dir_all(home).unwrap();
 }
 
