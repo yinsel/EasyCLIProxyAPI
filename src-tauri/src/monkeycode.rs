@@ -110,28 +110,12 @@ fn key(record: &Value) -> &str {
 }
 
 fn route_id(record: &Value, section: &str) -> String {
-    // Shared-credential providers may use different signing secrets or proxy
-    // overrides. Only share a bridge route when its forwarding settings agree.
-    // Length-prefix optional fields so absent and explicitly empty overrides
-    // remain distinct. Core-added IDs, model mappings and list order are not
-    // part of the bridge identity and must not invalidate persisted routes.
     let mut hash = Sha256::new();
-    hash.update(b"monkeycode-route-v2\0");
-    for value in [
-        Some(section),
-        record["base-url"].as_str(),
-        Some(key(record)),
-        record["signing_secret"].as_str(),
-        record["proxy-url"].as_str(),
-        record
-            .pointer("/api-key-entries/0/proxy-url")
-            .and_then(Value::as_str),
-    ] {
-        hash.update([u8::from(value.is_some())]);
-        let bytes = value.unwrap_or_default().as_bytes();
-        hash.update((bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
-    }
+    hash.update(section);
+    hash.update([0]);
+    hash.update(record["base-url"].as_str().unwrap_or_default());
+    hash.update([0]);
+    hash.update(key(record));
     format!("{:x}", hash.finalize())
 }
 
@@ -358,9 +342,8 @@ pub(crate) fn signature(body: &[u8], secret: &str) -> Result<String, String> {
     Ok(format!("v1={:x}", mac.finalize().into_bytes()))
 }
 
-// Adapt Responses payloads before both signing and forwarding. MonkeyCode's
-// prompt parser requires an input array even when instructions is non-empty.
-// Preserve prompt bytes and history while normalizing compatible input shapes.
+// Adapt Codex history for strict Responses schemas without discarding items:
+// normalize null reasoning content and supply search queries from a singular query.
 pub(crate) fn prepare_body<'a>(path: &str, body: &'a [u8]) -> Result<Cow<'a, [u8]>, String> {
     if !path.ends_with("/responses") && !path.ends_with("/responses/compact") {
         return Ok(Cow::Borrowed(body));
@@ -368,14 +351,6 @@ pub(crate) fn prepare_body<'a>(path: &str, body: &'a [u8]) -> Result<Cow<'a, [u8
     let mut payload: Value =
         serde_json::from_slice(body).map_err(|_| "Invalid MonkeyCode Responses JSON")?;
     let mut changed = false;
-    if let Some(text) = payload.get("input").and_then(Value::as_str) {
-        payload["input"] = json!([{
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": text}],
-        }]);
-        changed = true;
-    }
     if let Some(items) = payload.get_mut("input").and_then(Value::as_array_mut) {
         for item in items {
             if item.get("type").and_then(Value::as_str) == Some("reasoning")
@@ -549,15 +524,11 @@ async fn forward_with_config(request: Request, config: Value) -> Result<Response
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid MonkeyCode Responses JSON"))?;
     if post {
         let signed = signature(&body, record["signing_secret"].as_str().unwrap_or_default())
-            .map_err(|error| {
-                let message = match error.as_str() {
-                    "Invalid MonkeyCode prompt fields" =>
-                        "EasyCLI MonkeyCode bridge: invalid prompt field types; request was not sent upstream",
-                    "MonkeyCode requires a non-empty system prompt" =>
-                        "EasyCLI MonkeyCode bridge: missing non-empty system instructions; request was not sent upstream",
-                    _ => "EasyCLI MonkeyCode bridge: cannot sign request; request was not sent upstream",
-                };
-                (StatusCode::BAD_REQUEST, message)
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "MonkeyCode requires a valid non-empty system prompt",
+                )
             })?;
         headers.insert(
             SIGNATURE_HEADER,
@@ -665,162 +636,20 @@ mod tests {
     }
 
     #[test]
-    fn already_compatible_responses_keep_original_bytes() {
+    fn responses_without_null_reasoning_content_keep_original_bytes() {
         for raw in [
             r#"{ "instructions":"hi", "input":[] }"#,
             r#"{ "input":[{"type":"reasoning","summary":[]}] }"#,
             r#"{ "input":[{"type":"reasoning","content":[]}] }"#,
             r#"{ "input":[{"type":"reasoning","content":"invalid but not null"}] }"#,
             r#"{ "input":[{"role":"assistant","content":null},null] }"#,
+            r#"{ "input":"text" }"#,
         ] {
             let normalized = prepare_body("/v1/responses", raw.as_bytes()).unwrap();
             assert!(matches!(normalized, Cow::Borrowed(_)));
             assert_eq!(normalized.as_ref(), raw.as_bytes());
         }
         assert!(prepare_body("/v1/responses", b"not json").is_err());
-    }
-
-    #[test]
-    fn responses_string_input_is_normalized_without_inventing_instructions() {
-        for text in ["", "Hi", "first line\n第二行  "] {
-            let payload = json!({"input": text, "previous_response_id": "resp_previous"});
-            let raw = payload.to_string();
-            for path in ["/v1/responses", "/v1/responses/compact"] {
-                let body = prepare_body(path, raw.as_bytes()).unwrap();
-                let normalized: Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(
-                    normalized["input"],
-                    json!([{
-                        "type": "message", "role": "user",
-                        "content": [{"type": "input_text", "text": text}],
-                    }])
-                );
-                assert_eq!(normalized["previous_response_id"], "resp_previous");
-                assert!(normalized.get("instructions").is_none());
-                assert_eq!(
-                    signature(&body, "omas_test_secret").unwrap_err(),
-                    "MonkeyCode requires a non-empty system prompt"
-                );
-                assert!(matches!(
-                    prepare_body(path, &body).unwrap(),
-                    Cow::Borrowed(_)
-                ));
-            }
-            assert_eq!(
-                prepare_body("/v1/chat/completions", raw.as_bytes())
-                    .unwrap()
-                    .as_ref(),
-                raw.as_bytes()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_string_input_reaches_upstream_with_unchanged_prompt_signature() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = calls.clone();
-        let upstream = Router::new().fallback(move |request: Request| {
-            let observed = observed.clone();
-            async move {
-                observed.fetch_add(1, Ordering::SeqCst);
-                // Golden HMAC from an independent Node calculation, shared
-                // with signing_uses_full_secret_and_preserves_prompt_bytes.
-                assert_eq!(
-                    request.headers()[SIGNATURE_HEADER],
-                    "v1=b529b56a975dabea4b14956e84dbce9dd6c00dc3b6017e41a961899a9fa47a85"
-                );
-                assert!(!request.headers().contains_key(META_HEADER));
-                let bytes = to_bytes(request.into_body(), MAX_BODY).await.unwrap();
-                #[derive(Deserialize)]
-                struct StrictResponses {
-                    instructions: String,
-                    input: Vec<Value>,
-                }
-                let body: StrictResponses = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(body.instructions, "你好\n  world ");
-                assert_eq!(body.input.len(), 1);
-                assert_eq!(body.input[0]["role"], "user");
-                assert_eq!(body.input[0]["content"][0]["text"], "first line\n第二行  ");
-                let payload: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(payload["previous_response_id"], "resp_previous");
-                if payload["model"] == "upstream-reject" {
-                    return (StatusCode::BAD_REQUEST, "upstream-specific-error").into_response();
-                }
-                (
-                    [("content-type", "text/event-stream")],
-                    "data: accepted\n\n",
-                )
-                    .into_response()
-            }
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-        let mut record = json!({"api-key":"oma_test", "base-url":format!("http://{address}/v1"), "signing_secret":"omas_test_secret"});
-        let id = route_id(&record, "codex-api-key");
-        encode_record(&mut record, "http://127.0.0.1:1", "codex-api-key").unwrap();
-        let config = json!({"codex-api-key":[record]});
-        let payload = json!({"instructions":"你好\n  world ", "input":"first line\n第二行  ",
-            "model":"test", "previous_response_id":"resp_previous", "stream":true});
-        let request = |path: &str, body: &Value| {
-            Request::builder()
-                .method("POST")
-                .uri(format!("/monkeycode/{id}{path}"))
-                .header("authorization", "Bearer oma_test")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        for path in ["/v1/responses", "/v1/responses/compact"] {
-            let response = forward_with_config(request(path, &payload), config.clone())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                to_bytes(response.into_body(), MAX_BODY)
-                    .await
-                    .unwrap()
-                    .as_ref(),
-                b"data: accepted\n\n"
-            );
-        }
-        for (body, expected) in [
-            (
-                json!({"input":"Hi"}),
-                "missing non-empty system instructions",
-            ),
-            (
-                json!({"instructions":"present", "input":42}),
-                "invalid prompt field types",
-            ),
-        ] {
-            let (status, message) =
-                forward_with_config(request("/v1/responses", &body), config.clone())
-                    .await
-                    .unwrap_err();
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert!(message.contains(expected));
-            assert!(message.contains("request was not sent upstream"));
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let mut rejected = payload;
-        rejected["model"] = json!("upstream-reject");
-        let response = forward_with_config(request("/v1/responses", &rejected), config)
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            to_bytes(response.into_body(), MAX_BODY)
-                .await
-                .unwrap()
-                .as_ref(),
-            b"upstream-specific-error"
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-        server.abort();
     }
 
     #[tokio::test]
@@ -984,196 +813,6 @@ mod tests {
         json!({"name":"test", "base-url":upstream,
             "signing_secret":"omas_test_secret", "api-key-entries":[{"api-key":"oma_test"}],
             "headers":{"X-Team":"test"}, "models":[{"name":"test-model"}]})
-    }
-
-    #[test]
-    fn shared_credentials_keep_distinct_forwarding_routes() {
-        let original = provider("https://mc.example/v1");
-        let id = route_id(&original, "openai-compatibility");
-        for pointer in [
-            "/signing_secret",
-            "/proxy-url",
-            "/api-key-entries/0/proxy-url",
-        ] {
-            let mut changed = original.clone();
-            if pointer.starts_with("/api-key-entries") {
-                changed["api-key-entries"][0]["proxy-url"] = json!("direct");
-            } else {
-                changed[&pointer[1..]] = json!("different-setting");
-            }
-            assert_ne!(route_id(&changed, "openai-compatibility"), id, "{pointer}");
-        }
-        // An empty key proxy suppresses the provider/global proxy fallback.
-        let mut empty_override = original.clone();
-        empty_override["api-key-entries"][0]["proxy-url"] = json!("");
-        assert_ne!(route_id(&empty_override, "openai-compatibility"), id);
-
-        let mut runtime = original;
-        runtime["auth-index"] = json!("runtime-generated");
-        runtime["priority"] = json!(10);
-        runtime["models"] = json!([{"name":"another-model"}]);
-        runtime["headers"]["X-Team"] = json!("other");
-        assert_eq!(route_id(&runtime, "openai-compatibility"), id);
-    }
-
-    #[test]
-    fn legacy_shared_routes_migrate_and_rebind_without_losing_settings() {
-        for section in SECTIONS {
-            let mut first = provider("https://mc.example/v1");
-            if section != "openai-compatibility" {
-                first.as_object_mut().unwrap().remove("api-key-entries");
-                first["api-key"] = json!("oma_test");
-            }
-            first["proxy-url"] = json!("http://proxy.example:8080");
-            let mut second = first.clone();
-            second["signing_secret"] = json!("omas_other_secret");
-            let originals = [first, second];
-            let mut legacy_hash = Sha256::new();
-            legacy_hash.update(section);
-            legacy_hash.update([0]);
-            legacy_hash.update("https://mc.example/v1");
-            legacy_hash.update([0]);
-            legacy_hash.update("oma_test");
-            let legacy_id = format!("{:x}", legacy_hash.finalize());
-            let mut records = originals.clone();
-            for record in &mut records {
-                encode_record(record, "http://127.0.0.1:12345", section).unwrap();
-                record["base-url"] =
-                    json!(format!("http://127.0.0.1:12345/monkeycode/{legacy_id}/v1"));
-            }
-            // Exercise the same persisted metadata round-trip used on restart.
-            let yaml = serde_norway::to_string(&records).unwrap();
-            let mut restored: Vec<Value> = serde_norway::from_str(&yaml).unwrap();
-            for origin in ["http://127.0.0.1:23456", "http://127.0.0.1:34567"] {
-                for (record, original) in restored.iter_mut().zip(&originals) {
-                    encode_record(record, origin, section).unwrap();
-                    let id = route_id(original, section);
-                    assert_ne!(id, legacy_id);
-                    assert!(record["base-url"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with(&format!("{origin}/monkeycode/{id}")));
-                    let mut decoded = record.clone();
-                    decode_record(&mut decoded);
-                    assert_eq!(&decoded, original);
-                }
-                assert_ne!(restored[0]["base-url"], restored[1]["base-url"]);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn shared_credentials_use_selected_secret_after_reorder_and_removal() {
-        let upstream = Router::new().fallback(|request: Request| async move {
-            let supplied = request.headers()[SIGNATURE_HEADER]
-                .to_str()
-                .unwrap()
-                .to_owned();
-            assert!(!request.headers().contains_key(META_HEADER));
-            let body = to_bytes(request.into_body(), MAX_BODY).await.unwrap();
-            for secret in ["omas_first", "omas_second"] {
-                if signature(&body, secret).unwrap() == supplied {
-                    return secret.to_owned().into_response();
-                }
-            }
-            StatusCode::UNAUTHORIZED.into_response()
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-        for section in SECTIONS {
-            let mut records = Vec::new();
-            let mut ids = Vec::new();
-            for secret in ["omas_first", "omas_second"] {
-                let mut record = provider(&format!("http://{address}/v1"));
-                if section != "openai-compatibility" {
-                    record.as_object_mut().unwrap().remove("api-key-entries");
-                    record["api-key"] = json!("oma_test");
-                }
-                record["signing_secret"] = json!(secret);
-                ids.push(route_id(&record, section));
-                encode_record(&mut record, "http://127.0.0.1:1", section).unwrap();
-                records.push(record);
-            }
-            let request = |index: usize| {
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/monkeycode/{}/v1/chat/completions", ids[index]))
-                    .header("authorization", "Bearer oma_test")
-                    .header("x-api-key", "oma_test")
-                    .body(Body::from(
-                        r#"{"messages":[{"role":"system","content":"test"}]}"#,
-                    ))
-                    .unwrap()
-            };
-            for order in [[0, 1], [1, 0]] {
-                let mut config = json!({});
-                config[section] = json!([records[order[0]], records[order[1]]]);
-                for (index, expected) in ["omas_first", "omas_second"].iter().enumerate() {
-                    let response = forward_with_config(request(index), config.clone())
-                        .await
-                        .unwrap();
-                    assert_eq!(response.status(), StatusCode::OK);
-                    assert_eq!(
-                        to_bytes(response.into_body(), MAX_BODY)
-                            .await
-                            .unwrap()
-                            .as_ref(),
-                        expected.as_bytes()
-                    );
-                }
-            }
-            let mut remaining = json!({});
-            remaining[section] = json!([records[0]]);
-            assert_eq!(
-                forward_with_config(request(1), remaining)
-                    .await
-                    .unwrap_err()
-                    .0,
-                StatusCode::NOT_FOUND
-            );
-        }
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn shared_credentials_use_selected_proxy_override() {
-        let mut servers = Vec::new();
-        let mut records = Vec::new();
-        let mut ids = Vec::new();
-        for label in ["proxy-first", "proxy-second"] {
-            let app = Router::new().fallback(move || async move { label });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            servers.push(tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap()
-            }));
-            let mut record = provider("http://upstream.invalid/v1");
-            record["api-key-entries"][0]["proxy-url"] = json!(format!("http://{address}"));
-            ids.push(route_id(&record, "openai-compatibility"));
-            encode_record(&mut record, "http://127.0.0.1:1", "openai-compatibility").unwrap();
-            records.push(record);
-        }
-        let config = json!({"openai-compatibility":[records[1], records[0]]});
-        for (index, label) in ["proxy-first", "proxy-second"].iter().enumerate() {
-            let request = Request::builder()
-                .uri(format!("/monkeycode/{}/v1/models", ids[index]))
-                .header("authorization", "Bearer oma_test")
-                .body(Body::empty())
-                .unwrap();
-            let response = forward_with_config(request, config.clone()).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                to_bytes(response.into_body(), MAX_BODY)
-                    .await
-                    .unwrap()
-                    .as_ref(),
-                label.as_bytes()
-            );
-        }
-        for server in servers {
-            server.abort();
-        }
     }
 
     #[test]

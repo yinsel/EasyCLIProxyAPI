@@ -90,17 +90,11 @@ API Key 和明确的 Base URL，沿用对应协议的 URL 格式：OpenAI/Codex 
 Claude 填服务根地址。选择上游实际支持的模型；不支持模型发现时可手动添加。
 
 仍由随应用下载的原版 CLIProxyAPI 完成协议转换，应用内的本地转发层对最终请求中的
-system prompt 计算 HMAC-SHA256 签名，并流式转发响应。保留原有协议与提示词文本。
-Responses 的字符串 `input` 会在签名和转发前转为等价的 user 消息数组，兼容 MonkeyCode
-的请求解析；原有的历史规范化仍保留推理及搜索记录。
+system prompt 计算 HMAC-SHA256 签名，并流式转发响应。保留原有协议与请求体。
 经过该转发层的请求会移除 URL 中的全部查询参数（包括内核自动添加的 `beta=true`），
 再发往 MonkeyCode 上游。
 签名支持 HTTP/SSE；启用后关闭 Codex WebSocket。请求需包含非空 system prompt，
 健康检查会按对应协议加入测试 prompt 并签名。
-
-转发层不会自动补写缺失的 system instructions。本地提示词校验错误以
-`EasyCLI MonkeyCode bridge` 开头，并说明请求尚未发送到上游；MonkeyCode 服务端返回的
-错误则保留上游状态码和响应正文。
 
 使用期间请保持应用运行。每次启动内核前会刷新本地转发地址，转发层遵循上游代理设置。
 凭据保存在内核配置中，转发元数据通过保留请求头编码保存（并非加密），转发前会移除该头。
